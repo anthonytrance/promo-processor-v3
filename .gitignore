@@ -1,0 +1,23 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+venv/
+# Runtime state, saved logins and audio never belong in the repo.
+*.dpapi
+*.sqlite
+*.sqlite3
+*.db
+*credentials*.json
+*token*.json
+*.har
+*.wav
+*.aif
+*.aiff
+*.mp3
+*.flac
+*.partial
+.env
+
+# This installation's private notes
+LOCAL.md

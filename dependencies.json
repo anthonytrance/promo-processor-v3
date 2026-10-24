@@ -1,0 +1,59 @@
+{
+  "python": "3.12",
+  "skills": {
+    "email": {
+      "repo": "https://github.com/anthonytrance/email-skill",
+      "ref": "v1.0.0"
+    },
+    "dropbox": {
+      "repo": "https://github.com/anthonytrance/dropbox-skill",
+      "ref": "v1.0.0"
+    },
+    "google-workspace-files": {
+      "repo": "https://github.com/anthonytrance/google-workspace-files-skill",
+      "ref": "v1.0.0"
+    },
+    "browser-computer-control": {
+      "repo": "https://github.com/anthonytrance/browser-computer-control-skill",
+      "ref": "v1.0.0"
+    },
+    "web-research": {
+      "repo": "https://github.com/anthonytrance/web-research-skill",
+      "ref": "v1.0.0"
+    }
+  },
+  "programs": {
+    "ffmpeg": {
+      "why": "WAV to AIFF and precision checks",
+      "version": "8.1",
+      "install": "winget install Gyan.FFmpeg"
+    },
+    "ffprobe": {
+      "why": "audio length and format checks",
+      "version": "8.1",
+      "install": "comes with ffmpeg"
+    },
+    "7z": {
+      "why": "RAR promo packs",
+      "version": "any current",
+      "install": "winget install 7zip.7zip"
+    },
+    "chrome": {
+      "why": "one-time Inflyte and SoundCloud logins in the user's own profile",
+      "version": "any current",
+      "install": "winget install Google.Chrome"
+    },
+    "browser-use": {
+      "why": "Chrome login automation",
+      "version": "0.13.8",
+      "install": "uv tool install browser-use==0.13.8"
+    },
+    "gws": {
+      "why": "Google Drive promo links",
+      "version": "0.22.5",
+      "url": "https://github.com/googleworkspace/cli/releases/download/v0.22.5/google-workspace-cli-x86_64-pc-windows-msvc.zip",
+      "sha256_exe": "82ad48dd28564be969174aaef3e3f99816f959bf2519eeeb4ab77d84f9fa9c67",
+      "sha256_zip": "407705d695dc83d48b1c5f50d71b5aa64095bf6f17d5b439b2e9a373bbe67ec2"
+    }
+  }
+}

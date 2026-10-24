@@ -1,0 +1,9 @@
+#!/bin/sh
+# Refuses the commit when a staged file holds a secret or a private detail. See tools/check_secrets.py.
+for python in python py python3; do
+    if command -v "$python" >/dev/null 2>&1; then
+        exec "$python" tools/check_secrets.py
+    fi
+done
+echo "No Python found, so the secret check could not run and the commit was stopped."
+exit 1

@@ -1,0 +1,11 @@
+# promo-processor-v3, Python 3.12 on Windows. Exact versions tested 2026-10-24.
+beautifulsoup4==4.14.3
+soupsieve==2.8.3
+curl_cffi==0.15.0
+dropbox==12.0.2
+requests==2.33.1
+keyring==25.7.0
+mutagen==1.48.1
+psutil==7.2.2
+pywin32==311
+rarfile==4.5
