@@ -38,6 +38,10 @@ Ask your agent to "update the promos". It will run a dry run first, then collect
 
 Run `python -m pytest scripts` from this folder. The tests are offline and never touch a real account.
 
+## Licence
+
+MIT; see `LICENSE`.
+
 ## Privacy
 
 Your mail, logins, database and audio never go in this folder. The pre-commit hook in `.githooks` runs `tools/check_secrets.py`, which refuses to commit tokens, passwords, saved logins, audio, or any word from your own private word list. Personal notes for your installation can go in a `LOCAL.md` beside `SKILL.md`; git ignores it.
