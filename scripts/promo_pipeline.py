@@ -44,6 +44,35 @@ _EXCLUSION_TYPES = {"label": "labels", "labels": "labels", "artist": "artists", 
 _ARTIST_SPLIT = re.compile(r"\s*(?:,|&|\band\b|\bx\b|\bvs\.?|\bfeat\.?|\bft\.?|\bfeaturing\b|\bpres\.?|\bwith\b)\s*",
                            re.IGNORECASE)
 _BAD_FILENAME = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
+# 2026-10-28: a track number left on a Drive or folder file name ('01.Sound Players - ...') is never part of the artist.
+# A digit right after the separator keeps names such as '4.0 Artist'; '3CHO' or '0555' have no separator at all.
+_TRACK_NUMBER = re.compile(r"^\s*\d{1,3}\s*(?:[._)]|-(?=\s))\s*(?=[^\d\s])")
+
+
+def strip_track_number(name):
+    """'01.Artist - Title' or '02 - Artist - Title' without the number; anything else unchanged."""
+    rest = _TRACK_NUMBER.sub("", name or "", count=1)
+    return rest if rest != name and " - " in rest else name
+
+
+def _script_trim(text):
+    """'Yukes玉刻' is credited as 'Yukes' elsewhere: a name that mixes Latin and another script keeps the Latin part."""
+    letters = [c for c in text if c.isalpha()]
+    latin = [c for c in letters if "LATIN" in unicodedata.name(c, "")]
+    if not latin or len(latin) == len(letters):
+        return text
+    return "".join(c for c in text if not c.isalpha() or "LATIN" in unicodedata.name(c, ""))
+
+
+def artist_names(text, fold=normalized):
+    """The order-free set of credited names in an artist field, each in its comparison form."""
+    return {fold(_script_trim(a)) for a in _ARTIST_SPLIT.split(text or "") if fold(_script_trim(a))}
+
+
+def label_is_artist(label, track):
+    """True when the label is only a credited artist's name: the promo sender, not proof of an imprint."""
+    artist = track.get("artist") or (track.get("name") or "").partition(" - ")[0]
+    return bool(label) and normalized(_script_trim(label)) in artist_names(artist)
 
 
 class GateRequired(RuntimeError):
@@ -66,7 +95,7 @@ def mix_key(name):
     artist, separator, rest = stem.partition(" - ")
     if not separator:
         return normalized(stem)
-    artists = sorted({normalized(a) for a in _ARTIST_SPLIT.split(artist) if normalized(a)})
+    artists = sorted(artist_names(artist))
     return ";".join(artists) + "|" + normalized(rest)
 
 
@@ -85,7 +114,7 @@ def loose_key(name):
     if not separator:
         return None
     credits = " " + " ".join(normalized(c) for c in re.findall(r"\(([^()]*)\)", rest)) + " "
-    artists = sorted({normalized(a) for a in _ARTIST_SPLIT.split(artist) if normalized(a)})
+    artists = sorted(artist_names(artist))
     kept = [a for a in artists if " " + a + " " not in credits] or artists
     words = [w for w in normalized(rest).split() if w not in {"mix", "version"}]
     return ";".join(kept) + "|" + " ".join(words)
@@ -124,7 +153,7 @@ _FEATURING = re.compile(r"\s*\((?:feat\.?|ft\.?|featuring)\s[^()]*\)", re.IGNORE
 # 2026-10-24: Promoly served 15-second preview clips as 'extended mixes' for files it had not finished
 # uploading. A real club track is never this short; intros, interludes and orchestral or piano pieces can be.
 PREVIEW_SECONDS = 60
-_SHORT_PIECE = re.compile(r"(intro|outro|interlude|orchestral|piano|ambient|skit|prelude|acapella|a cappella|loop|fx)",
+_SHORT_PIECE = re.compile(r"\b(intro|outro|interlude|orchestral|piano|ambient|skit|prelude|acapella|a cappella|loop|fx)\b",
                           re.IGNORECASE)
 # 2026-10-23: an edit longer than this is still a DJ tool, whatever its name says. Too many versions beat too few.
 LONG_EDIT_SECONDS = 300
@@ -180,7 +209,8 @@ def _mix_parts(name):
 def version_kind(name):
     """'extended', 'dj' (DJ Edit without radio), 'short' (radio or edit) or 'full' (original, club, anything else)."""
     mix = " ".join(mix_parts(name)[1])
-    if re.search(r"extend", mix, re.IGNORECASE):
+    # 2026-10-28: Euphonic calls its extended mix 'DJ Version' ('David Broaders - Polylith (DJ Version)').
+    if re.search(r"extend|\bdj\s+version\b", mix, re.IGNORECASE):
         return "extended"
     if _DJ_EDIT.search(mix) and not re.search(r"radio", mix, re.IGNORECASE):
         return "dj"
@@ -191,7 +221,7 @@ def version_kind(name):
 def version_group(name):
     """Tracks that are lengths of the same mix share a group: 'X Remix' and 'X Extended Remix' do, 'Dub Mix' does not."""
     base, mixes = mix_parts(name)
-    rest = _VERSION_WORDS.sub(" ", re.sub(r"\bdj\s+(?=radio\b)", " ", " ".join(mixes), flags=re.IGNORECASE))
+    rest = _VERSION_WORDS.sub(" ", re.sub(r"\bdj\s+(?=radio\b|version\b)", " ", " ".join(mixes), flags=re.IGNORECASE))
     return normalized(base) + "|" + normalized(rest)
 
 
@@ -204,6 +234,10 @@ def _fold(text):
 
 
 _FEATURING_NAME = re.compile(r"\((?:feat\.?|ft\.?|featuring)\s([^()]*)\)", re.IGNORECASE)
+_PART = re.compile(r"\d|\b(?:part|pt|vol|chapter|act|episode)\b", re.IGNORECASE)
+# 'Rocking (Reloaded) (Extended Mix)' is a new version of 'Rocking (Extended Mix)', not a subtitle.
+_REWORK = re.compile(r"\b(?:reloaded|revisited|remaster\w*|redux|reprise|reimagined|refix|remake|re-?edit|rerub|update[ds]?"
+                     r"|anniversary|classic|reboot|reconstruct\w*|reborn|returns|rewired|rebirth)\b", re.IGNORECASE)
 _GUEST = re.compile(r"\((?:feat\.?|ft\.?|featuring)\s([^()]*)\)|\s(?:feat\.?|ft\.?|featuring)\s(.+)$", re.IGNORECASE)
 
 
@@ -222,11 +256,18 @@ def track_identity(name):
     guests = [m.group(1) for m in _FEATURING_NAME.finditer(title)]
     base, mixes = mix_parts("x - " + title)
     base = base.partition(" - ")[2]
+    # 2026-10-28: 'Sturm Der Nacht (Nur Für Dich) (Extended Mix)' is 'Sturm Der Nacht (Extended Mix)' in the library.
+    # A bracket before the mix credit that names no mix, part or short piece is a subtitle, not a version.
+    mixes = [m for i, m in enumerate(mixes) if i == len(mixes) - 1 or _MIX_WORDS.search(m)
+             or _SHORT_PIECE.search(m) or _PART.search(m) or _REWORK.search(m)]
     guests += [g for part in (base, artist) for m in _GUEST.finditer(part) for g in m.groups() if g]
     artist = _GUEST.sub("", artist)
-    credit = _fold(_VERSION_WORDS.sub(" ", re.sub(r"\bdj\s+(?=radio\b)", " ", " ".join(mixes), flags=re.IGNORECASE)))
+    credit = _fold(_VERSION_WORDS.sub(" ", re.sub(r"\bdj\s+(?=radio\b|version\b)", " ", " ".join(mixes), flags=re.IGNORECASE)))
+    # 'Bart Skils x Waska Remix' and 'Bart Skils & Waska Remix' are one credit.
+    credit = re.sub(r"(?<!\S)x(?!\S)", " ", credit).split()
+    credit = " ".join(credit)
     title = _fold(_GUEST.sub("", base))
-    artists = {_fold(a) for part in [artist, *guests] for a in _ARTIST_SPLIT.split(part) if _fold(a)}
+    artists = {a for part in [artist, *guests] for a in artist_names(part, _fold)}
     kept = {a for a in artists if " " + a + " " not in " " + credit + " "} or artists
     return (frozenset(kept), title + "|" + credit) if title else None
 
@@ -236,6 +277,7 @@ class VersionIndex:
 
     def __init__(self, paths=()):
         self.by_work = {}
+        self.by_title = {}
         for path in paths:
             self.add(path)
 
@@ -247,6 +289,7 @@ class VersionIndex:
 
     def add_known(self, path, artists, work, kind):
         self.by_work.setdefault(work, []).append((artists, path, kind))
+        self.by_title.setdefault(work.partition("|")[0], []).append((artists, path, kind, work.partition("|")[2]))
 
     def versions(self, *names):
         """(path, kind) of each indexed version of the same track; artist lists may differ by a missing co-artist."""
@@ -258,7 +301,24 @@ class VersionIndex:
             for artists, path, kind in self.by_work.get(identity[1], ()):
                 if artists <= identity[0] or identity[0] <= artists:
                     found[path] = kind
+            # 2026-10-28: 'Bart Skils x Waska Remix' was in the library as 'Bart Skils & Weska Remix'. A remix
+            # credit one letter away, same artists and title, is a typo of the same mix, not another remixer.
+            title, _, credit = identity[1].partition("|")
+            for artists, path, kind, other in self.by_title.get(title, ()):
+                if (artists <= identity[0] or identity[0] <= artists) and one_letter_apart(credit, other):
+                    found.setdefault(path, kind)
         return list(found.items())
+
+
+def one_letter_apart(a, b):
+    """Two credits of 8 or more characters that differ in exactly one letter at the same place."""
+    return len(a) == len(b) >= 8 and sum(x != y for x, y in zip(a, b)) == 1 and \
+        all(x.isalpha() and y.isalpha() for x, y in zip(a, b) if x != y)
+
+
+def unmarked_name(path):
+    """A name with no mix credit at all: 'Artist - Title [Label].aiff'."""
+    return not mix_parts(path.rpartition("/")[2])[1]
 
 
 def main_versions(members):
@@ -313,7 +373,7 @@ def title_key(name):
     if not separator:
         return None
     title = re.sub(r"\([^()]*\)", " ", rest)
-    artists = sorted({normalized(a) for a in _ARTIST_SPLIT.split(artist) if normalized(a)})
+    artists = sorted(artist_names(artist))
     return ";".join(artists) + "|" + normalized(title)
 
 
@@ -587,8 +647,13 @@ def decide(store, library, key, offer, asset_key=None):
         owned = owned.versions(*names) if isinstance(owned, VersionIndex) else []
         longer = [p for p, k in owned if (k == "extended" and kind != "extended") or (k == "full" and kind == "short")]
         same = [p for p, k in owned if k == kind or (k == "dj" and kind == "short")]
-        if longer:
-            return "skip", "a longer version of this track is already in library", {"library": longer[:3]}
+        # 2026-10-28: an unmarked library copy is usually the extended mix under a store-less name
+        # ('Amos & Riot Night x ... - Loved In Silence [FSOE]' beside the offered Extended Mix), so it counts as owned.
+        # The same unmarked name delivered in this test pass still gives way to the extended mix.
+        unmarked = [p for p, k in owned if k == "full" and kind == "extended" and unmarked_name(p)
+                    and not p.lower().startswith(DEST.lower() + "/")]
+        if longer or unmarked:
+            return "skip", "a longer version of this track is already in library", {"library": (longer or unmarked)[:3]}
         if same:
             found = same
         elif kind == "extended" and owned:
@@ -693,6 +758,12 @@ def collect_release(store, adapter, source_id, library, dry_run=False, allow_gat
     release = adapter.release(source_id)
     from promo_metadata import apply_resolution
     for track in release["tracks"]:
+        stripped = strip_track_number(track["name"])
+        if stripped != track["name"]:
+            track.setdefault("original_name", track["name"])
+            if track.get("artist"):
+                track["artist"] = strip_track_number(track["artist"] + " - x")[:-4]
+            track["name"] = stripped
         apply_resolution(track, store.root)
     summary = {"release": release["title"], "label": release["label"], "tracks": []}
     if release.get("warnings"):
@@ -949,6 +1020,9 @@ def _fetch_and_deliver(store, adapter, source_id, release, plan, todo, summary, 
         problems = tag_mismatches(track, label, item)
         from promo_metadata import label_issues
         problems += label_issues(label)
+        if not track.get("metadata_resolution") and label_is_artist(label, track):
+            # 2026-10-28: Talla 2XLC and Sound Players send their own promos; the sender's name ended up as the label.
+            problems.append("Label is only the artist's name (the promo sender); research the actual imprint")
         problems += track.get("metadata_conflicts", [])
         problems += ["required tag validation failed: " + str(issue) for issue in issues]
         problems += ["processor flagged this file as unknown" for u in report.get("unknowns", [])

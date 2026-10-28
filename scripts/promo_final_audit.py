@@ -18,7 +18,7 @@ from process_promos import (apply_typo_corrections, build_target_filename, clean
 
 
 # Bump when a filename, tag or audio rule changes, so earlier passes are checked again.
-AUDIT_RULES = "2026-10-24a"
+AUDIT_RULES = "2026-10-28b"
 
 
 def nfc(value):
@@ -40,8 +40,13 @@ def filename_and_tag_issues(name, local):
     info = {"artist": artist, "title": title, "label": label}
     expected = build_target_filename(info, ".aiff" if Path(name).suffix.lower() in {".wav", ".aif"} else Path(name).suffix.lower())
     issues = verify_tags(str(local), has_label=True)
-    from promo_metadata import label_issues
+    from promo_metadata import find_resolution, label_issues
+    from promo_pipeline import label_is_artist, strip_track_number
     issues += label_issues(label)
+    if label_is_artist(label, {"artist": artist, "name": name}) and not find_resolution(name):
+        issues.append("Label is only the artist's name (the promo sender); research the actual imprint")
+    if strip_track_number(name) != name:
+        issues.append("Filename starts with a track number")
     if nfc(name) != nfc(expected):
         issues.append("Filename does not match the normalized artist, title, mix, label and extension: " + expected)
     parsed = parse_filename(name, {})
@@ -117,7 +122,7 @@ def resolution_and_version_issues(store, name, test_names, duration=None, owned=
     lowercase_name: the name comes from the lowercase library index, so only a rename beyond capitalization counts.
     """
     from promo_metadata import find_resolution
-    from promo_pipeline import VersionIndex, dj_version, version_kind
+    from promo_pipeline import VersionIndex, dj_version, unmarked_name, version_kind
     issues = []
     resolution = find_resolution(name, store.root)
     if resolution:
@@ -132,7 +137,9 @@ def resolution_and_version_issues(store, name, test_names, duration=None, owned=
     if any(longer(k) for p, k in tests.versions(name) if nfc(Path(p).name).casefold() != nfc(name).casefold()):
         issues.append("Shorter version; a longer version of the same track is in the test folder")
     owned = owned if isinstance(owned, VersionIndex) or owned is None else VersionIndex(owned)
-    hits = [p for p, k in (owned.versions(name) if owned else []) if longer(k) or k == kind]
+    # An unmarked library copy of an extended mix is the same track (2026-10-28, Amos & Riot Night).
+    hits = [p for p, k in (owned.versions(name) if owned else [])
+            if longer(k) or k == kind or (kind == "extended" and k == "full" and unmarked_name(p))]
     if hits:
         issues.append("Same track already in the library in this or a longer version: " + hits[0])
     return issues

@@ -17,7 +17,7 @@ from bs4 import BeautifulSoup
 from curl_cffi import requests
 
 from promo_automation import ACCOUNT, CREDENTIAL_SERVICE, STATE, Store, email_skill, now
-from promo_pipeline import LibraryIndex, collect_release, label_from_subject, write_stream
+from promo_pipeline import LibraryIndex, collect_release, label_from_subject, label_is_artist, write_stream
 
 BASE = "https://www.promo-cloud.com"
 SERVICE = CREDENTIAL_SERVICE
@@ -36,6 +36,15 @@ def protect_json(path, data):
 
 def read_protected_json(path):
     return json.loads(win32crypt.CryptUnprotectData(path.read_bytes(), None, None, None, 0)[1])
+
+
+def catalogue_label(catalogue):
+    """Label for a catalogue number from label_codes.csv ('TCR077' -> Technoclub Retro), or None."""
+    from pathlib import Path
+    from process_promos import load_label_codes
+    prefix = re.match(r"[A-Za-z]+", catalogue or "")
+    codes = load_label_codes(str(Path(__file__).with_name("label_codes.csv")))
+    return codes.get(prefix.group(0).upper()) if prefix else None
 
 
 class PromoCloud:
@@ -216,11 +225,16 @@ class PromoCloud:
         """Normalize this platform's contract for the shared pipeline."""
         source, promotion, contact = self._scope(source_id)
         snapshot = self.snapshot(source_id)
-        label = json.loads(source["metadata"]).get("label") or label_from_subject(source["subject"])[0]
+        subject_label, catalogue = label_from_subject(source["subject"])
+        label = json.loads(source["metadata"]).get("label") or subject_label
         tracks = [{"name": row["_TrackTitle"].strip(), "artist": row.get("_trackArtist"), "title": row.get("_trackTiltleOnly"),
                    "mix": row.get("_trackVersion"), "duration": row.get("_trackDurationS"), "pack_id": row.get("_TrackPackId"),
                    "files": [{"id": f["_FileGUID"], "type": f["_FileTypeName"], "size_kb": f.get("_FileSizeKB")}
                              for f in row.get("_files", [])]} for row in snapshot["tracks"]]
+        if any(label_is_artist(label, t) for t in tracks):
+            # 2026-10-28: the subject names the sender ('Talla 2XLC [TTR080A] : Talla 2XLC, YORK ...'), and an artist
+            # who sends their own promos is not the imprint. The catalogue prefix may name it; otherwise research does.
+            label = catalogue_label(catalogue)
         title = re.sub(r"^\s*Music Promo:\s*", "", snapshot["title"]).strip()
         return {"title": title, "label": label, "gated": snapshot["flags"]["lockTracks"],
                 "feedback_left": snapshot["flags"]["feedbackLeft"], "tracks": tracks}

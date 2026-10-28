@@ -769,3 +769,58 @@ class ExclusionCsvTests(unittest.TestCase):
                 self.assertEqual(len(calls), 1, "read once per TTL")
                 pipeline._EXCLUSIONS_LOADED.clear()
                 self.assertEqual(pipeline.load_exclusions()["labels"], ["gone label"], "offline uses the saved copy")
+
+
+class ReportedDuplicateTests(OwnedVersionTests):
+    """2026-10-28: duplicates and names the user found in the test folder."""
+
+    def test_unmarked_library_copy_owns_the_extended_mix(self):
+        owned = ["/music library/promos/latest promos/amos & riot night x bryce keuris x aylin aloski - loved in silence [fsoe].aiff"]
+        self.assertEqual(self.decide("Amos & Riot Night, Bryce Keuris & Aylin Aloski - Loved in Silence (Extended Mix)", owned), "skip")
+        this_pass = [pipeline.DEST.lower() + "/amos & riot night - loved in silence [fsoe].aiff"]
+        self.assertEqual(self.decide("Amos & Riot Night - Loved in Silence (Extended Mix)", this_pass), "download")
+
+    def test_dj_version_is_the_extended_mix(self):
+        owned = ["/music library/promos/latest promos/david broaders - polylith (dj version) [euphonic].mp3"]
+        self.assertEqual(pipeline.version_kind("David Broaders - Polylith (DJ Version)"), "extended")
+        self.assertEqual(self.decide("David Broaders - Polylith", owned), "skip")
+
+    def test_remixer_typo_and_x_separator_are_the_same_mix(self):
+        owned = ["/music library/promos/2026/09/soul central - strings of life un amore supremo (bart skils & weska remix) [drumcode].aif"]
+        self.assertEqual(self.decide("Soul Central - Strings Of Life - Un Amore Supremo (Bart Skils x Waska Remix)", owned), "skip")
+        self.assertEqual(self.decide("Soul Central - Strings Of Life - Un Amore Supremo (Joris Voorn Remix)", owned), "download")
+        self.assertFalse(pipeline.one_letter_apart("aly", "ali"))
+        self.assertFalse(pipeline.one_letter_apart("2026 part 1", "2026 part 2"))
+
+    def test_mixed_script_artist_matches_its_latin_credit(self):
+        self.assertEqual(pipeline.mix_key("Alex M.O.R.P.H. & Yukes玉刻 - Calling Beijing (Extended Mix) [Blue Dot Trance].aiff"),
+                         pipeline.mix_key("alex m.o.r.p.h. x yukes - calling beijing (extended mix) [blue dot trance].aiff"))
+        self.assertNotEqual(pipeline.mix_key("玉刻 - Calling Beijing"), pipeline.mix_key("Yukes - Calling Beijing"))
+
+    def test_subtitle_before_the_mix_is_not_a_version(self):
+        owned = ["/music library/promos/latest promos/talla 2xlc & marc van linden - sturm der nacht (extended mix) [technoclub retro].aiff"]
+        self.assertEqual(self.decide("Talla 2XLC & Marc van Linden - Sturm Der Nacht (Nur Für Dich) (Extended Mix)", owned), "skip")
+        self.assertEqual(self.decide("Talla 2XLC & Marc van Linden - Sturm Der Nacht (Pt. 2) (Extended Mix)", owned), "download")
+        self.assertEqual(self.decide("Talla 2XLC & Marc van Linden - Sturm Der Nacht (Intro) (Extended Mix)", owned), "download")
+        rocking = ["/music library/promos/2026/07/dirty signal & 2aces - rocking (extended mix) [revealed recordings].aiff"]
+        self.assertEqual(self.decide("Dirty Signal & 2ACES - Rocking (Reloaded) (Extended Mix)", rocking), "download")
+
+    def test_track_numbers_are_stripped_but_numeric_artists_stay(self):
+        self.assertEqual(pipeline.strip_track_number("01.Sound Players - Call Me Tomorrow 2026 (Original Mix)"),
+                         "Sound Players - Call Me Tomorrow 2026 (Original Mix)")
+        self.assertEqual(pipeline.strip_track_number("02 - Sound Players - Call Me Tomorrow"), "Sound Players - Call Me Tomorrow")
+        for name in ["3CHO - Pulse", "0555 - Night", "8Kays - Run", "4.0 Artist - Song", "01.Untitled"]:
+            self.assertEqual(pipeline.strip_track_number(name), name)
+        from process_promos import parse_filename
+        self.assertEqual(parse_filename("01.Sound Players - Call Me Tommorow 2026 (ALAT Remix).wav", {})["artist"], "Sound Players")
+
+    def test_sender_name_as_label_is_held(self):
+        self.assertTrue(pipeline.label_is_artist("Talla 2XLC", {"name": "Talla 2XLC, YORK & MIDI Kittyy - I'm Yours (Extended Mix)"}))
+        self.assertTrue(pipeline.label_is_artist("Sound Players", {"name": "Sound Players - Call Me Tomorrow 2026", "artist": None}))
+        self.assertFalse(pipeline.label_is_artist("That's Trance", {"name": "Talla 2XLC, YORK & MIDI Kittyy - I'm Yours"}))
+        self.assertFalse(pipeline.label_is_artist(None, {"name": "Talla 2XLC - Dream Of You"}))
+
+    def test_promo_cloud_sender_label_falls_back_to_catalogue_prefix(self):
+        import promo_cloud
+        self.assertEqual(promo_cloud.catalogue_label("TCR077"), "Technoclub Retro")
+        self.assertIsNone(promo_cloud.catalogue_label(None))

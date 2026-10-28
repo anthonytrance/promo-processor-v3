@@ -65,6 +65,7 @@ TYPO_CORRECTIONS = {
     "Exteneded": "Extended",
     "Orignal": "Original",
     "Extnded": "Extended",
+    "Tommorow": "Tomorrow",
 }
 # Tags to remove during cleanup
 JUNK_TAG_KEYS = {"TXXX:ENCODER", "TXXX:HANDLER_NAME"}
@@ -347,7 +348,8 @@ def parse_numbered_prefix_filename(filename: str):
     Returns parsed dict or None.
     """
     stem = Path(filename).stem
-    m = re.match(r"^\d{1,3}\s*-\s*(.+)$", stem)
+    # 2026-10-28: '01.Artist - Title' and '01) Artist - Title' too, when an 'Artist - Title' follows the number.
+    m = re.match(r"^\d{1,3}\s*(?:-|[._)])\s*(?=[^\d\s])(.+ - .+)$", stem)
     if not m:
         return None
     rest = m.group(1)
