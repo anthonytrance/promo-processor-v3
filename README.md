@@ -23,8 +23,8 @@ The installer names any other program it needs (ffmpeg, 7-Zip, browser-use) toge
 3. Set up mail access as described in the email skill's README: add your promo mailbox to its credentials file.
 4. Set up Dropbox access as described in the dropbox skill's README.
 5. Optionally set up Google Drive access as described in the google-workspace-files skill's README, so Google Drive promo links can be read.
-6. Run `python scripts/promo_doctor.py`. It makes one read-only request per service and names whatever still needs a login.
-7. Save the platform logins the doctor asks for: `python scripts/promo_doctor.py save-password promo-cloud`, `save-password promobox`, and `save-soundcloud`. Typing is hidden. Logins are stored with Windows protection for your user account, never in this folder.
+6. Run `python scripts/promo_doctor.py`. It verifies mail, Dropbox, Google and a saved SoundCloud session, and checks other platforms for saved logins locally. SoundCloud renews an expired token before its profile check.
+7. Save the platform logins the doctor asks for: `python scripts/promo_doctor.py save-password promo-cloud`, `save-password promobox`, and `save-soundcloud`. Typing is hidden. SoundCloud needs both access and refresh tokens; agents can provision a fresh pair from an existing Chrome sign-in without a password using `soundcloud.py bootstrap-session`, see `references/soundcloud.md`. Logins are stored with Windows protection for your user account, never in this folder.
 
 ## Settings
 

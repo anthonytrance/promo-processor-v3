@@ -4,13 +4,14 @@ Promo mails link a private track or playlist (soundcloud.com/<user>/<slug>/s-<se
 on.soundcloud.com short link). api-v2 /resolve turns the link into JSON; private items carry a secret_token that the
 download call needs. Playlists list only the first few tracks in full, the rest are stubs fetched through /tracks with
 the playlist's secret. /tracks/<id>/download returns a signed cf-media.sndcdn.com URL of the uploaded original.
-The account login is an OAuth token captured once from normal Chrome (1Password login with authenticator code), kept
-DPAPI-protected in soundcloud-session.dpapi. No feedback gate exists. Profile links name no specific promo and are skipped.
+The access and rotating refresh cookies are kept DPAPI-protected in soundcloud-session.dpapi. A separate
+automation login avoids competing with a browser for one refresh cookie. No feedback gate exists.
 """
 import argparse
 import html
 import json
 import re
+import sys
 import time
 from urllib.parse import urlsplit
 
@@ -21,9 +22,9 @@ from promo_automation import SETTINGS, Store
 from promo_cloud import protect_json, read_protected_json
 from promo_mail import discover, newest_offer_age
 from promo_pipeline import LibraryIndex, collect_release, write_stream
+from soundcloud_session import SESSION_FILE, SoundCloudSession, TokenExpired
 
 API = "https://api-v2.soundcloud.com"
-SESSION_FILE = "soundcloud-session.dpapi"
 _PROMO_PREFIX = re.compile(r"^\s*(?:\[\s*promo\s*\]|promo\s*(?://|:|-|\|))\s*", re.I)
 _BRACKET = re.compile(r"\s*\[([^\[\]]*)\]\s*$")
 _MIX_WORDS = re.compile(r"\b(mix|remix|edit|version|rework|dub|instrumental|bootleg|vip)\b", re.I)
@@ -169,10 +170,9 @@ def normalize_release(item, extra_tracks=(), subject=None, sender=None):
 class SoundCloud:
     def __init__(self, store):
         self.store, self.calls, self.last = store, 0, 0.0
-        saved = store.root / SESSION_FILE
-        if not saved.exists():
-            raise RuntimeError("No SoundCloud login saved; sign in once in normal Chrome and capture the OAuth token")
-        token = read_protected_json(saved)["oauth_token"]
+        self.auth = SoundCloudSession(store.root)
+        token = self.auth.token()
+        self.calls += self.auth.calls
         self.session = requests.Session(impersonate="chrome124", headers={
             "Authorization": "OAuth " + token, "Origin": "https://soundcloud.com", "Referer": "https://soundcloud.com/"})
 
@@ -191,10 +191,20 @@ class SoundCloud:
         return response
 
     def _api(self, path, **params):
-        response = self._send(API + path, params=params)
-        if response.status_code == 401:
-            raise RuntimeError("SoundCloud login expired; sign in again in normal Chrome")
-        return response
+        before = self.auth.calls
+        try:
+            token = self.auth.token()
+            self.session.headers["Authorization"] = "OAuth " + token
+            response = self._send(API + path, params=params)
+            if response.status_code == 401:
+                token = self.auth.token(rejected_token=token)
+                self.session.headers["Authorization"] = "OAuth " + token
+                response = self._send(API + path, params=params)
+                if response.status_code == 401:
+                    raise TokenExpired("SoundCloud refused the renewed token; save a fresh session")
+            return response
+        finally:
+            self.calls += self.auth.calls - before
 
     def resolve(self, url):
         """Resolve a mailed link to track or playlist JSON; short links redirect to the item page."""
@@ -315,6 +325,8 @@ class SoundCloud:
                 done.add(urn)
                 summary = collect_release(self.store, self, sid, library, dry_run=dry_run, allow_gate=allow_gate)
                 report.append({"release": summary.get("release") or subject, "tracks": summary["tracks"]})
+            except TokenExpired:
+                raise  # stop the platform once, rather than repeat a failed login for every promo
             except Exception as error:
                 self.store.event(sid, "batch", "release_failed", release=subject, error=str(error)[:200])
                 report.append({"release": subject, "result": "failed: " + str(error)[:160]})
@@ -333,7 +345,24 @@ def main():
     batch.add_argument("--max-age-days", type=int, default=30)
     for command in (collect, batch):
         command.add_argument("--dry-run", action="store_true")
+    sub.add_parser("check-session", help="verify the saved login with a read-only profile request")
+    sub.add_parser("refresh-session", help="renew once and verify, without opening promos")
+    sub.add_parser("save-session", help="read an access/refresh token pair as JSON from stdin; never print it")
+    sub.add_parser("bootstrap-session", help="mint a separate token pair from an existing browser sign-in, JSON on stdin")
     args = parser.parse_args()
+    if args.command in {"check-session", "refresh-session", "save-session", "bootstrap-session"}:
+        from promo_automation import STATE
+        auth = SoundCloudSession(STATE)
+        if args.command == "bootstrap-session":
+            result = auth.bootstrap(json.load(sys.stdin))
+        elif args.command == "save-session":
+            result = auth.save(json.load(sys.stdin))
+        else:
+            if args.command == "refresh-session":
+                auth.token(force=True)
+            result = auth.check()
+        print(json.dumps(result | {"http_requests": auth.calls}))
+        return
     store = Store()
     try:
         if args.command == "discover-mail":

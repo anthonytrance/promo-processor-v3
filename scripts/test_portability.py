@@ -38,6 +38,17 @@ class DoctorTest(unittest.TestCase):
         with self.assertRaises(SystemExit):
             promo_doctor.save("save-password", "inflyte")
 
+    def test_saved_but_invalid_soundcloud_session_fails_doctor(self):
+        with mock.patch.object(sys, "argv", ["promo_doctor.py"]), \
+                mock.patch.object(promo_doctor, "check_mail", return_value="mail okay"), \
+                mock.patch.object(promo_doctor, "check_dropbox", return_value="Dropbox okay"), \
+                mock.patch.object(promo_doctor, "check_google", return_value="Google okay"), \
+                mock.patch.object(promo_doctor, "platform_logins", return_value=[("SoundCloud", True, "save again")]), \
+                mock.patch.object(promo_doctor, "check_soundcloud", side_effect=RuntimeError("session expired")), \
+                mock.patch("builtins.print") as printed:
+            self.assertEqual(promo_doctor.main(), 1)
+        self.assertTrue(any("Not ready: SoundCloud" in str(call) for call in printed.call_args_list))
+
 
 class SecretCheckTest(unittest.TestCase):
     def test_real_looking_token_is_blocked(self):

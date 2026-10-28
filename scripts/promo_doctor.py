@@ -2,8 +2,9 @@
 
     python promo_doctor.py
 
-Mail, Dropbox and Google each get one read-only request. Promo platforms are only checked for a saved login on
-this computer: no platform is contacted, because opening some of them marks promos as viewed. A platform with no
+Mail, Dropbox, Google and a saved SoundCloud session get a read-only check. SoundCloud may renew an expired
+access token first; no promo is opened. Other promo platforms are only checked for a saved login on
+this computer, because opening some of them marks promos as viewed. A platform with no
 saved login is fine when no promos arrive from it; the first run names any that are needed. Exit code 0 means
 everything the run cannot do without is ready.
 """
@@ -24,7 +25,7 @@ PLATFORM_LOGINS = (
      "sign in once in Chrome, then pipe the remember_user_token cookie as {\"value\": ..., \"expires\": ...} into "
      "python inflyte.py save-token"),
     ("SoundCloud", "file", "soundcloud-session.dpapi",
-     "sign in once in Chrome, then run python promo_doctor.py save-soundcloud and paste the oauth_token cookie"),
+     "run python promo_doctor.py save-soundcloud and supply both session cookies from a separate SoundCloud login"),
 )
 PASSWORD_PLATFORMS = {"promo-cloud", "promobox"}
 
@@ -64,6 +65,13 @@ def platform_logins():
         yield name, saved, how
 
 
+def check_soundcloud():
+    from soundcloud_session import SoundCloudSession
+    result = SoundCloudSession(STATE).check()
+    return "SoundCloud login verified, " + ("automatic renewal saved" if result["renewal_saved"] else
+                                           "access token only, save the refresh token for automatic renewal")
+
+
 def save(command, platform=None):
     """Ask for a secret with typing hidden and keep it only in Windows' own protected stores."""
     import getpass
@@ -72,11 +80,11 @@ def save(command, platform=None):
         if secret:
             keyring.set_password(promo_automation.CREDENTIAL_SERVICE, f"{platform}:{ACCOUNT}", secret)
     elif command == "save-soundcloud":
-        from promo_cloud import protect_json
+        from soundcloud_session import SoundCloudSession
         secret = getpass.getpass("SoundCloud oauth_token cookie value (typing is hidden): ").strip()
         if secret:
-            STATE.mkdir(parents=True, exist_ok=True)
-            protect_json(STATE / "soundcloud-session.dpapi", {"oauth_token": secret})
+            refresh = getpass.getpass("SoundCloud oauth_refresh_token cookie value (typing is hidden): ").strip()
+            SoundCloudSession(STATE).save({"oauth_token": secret, "oauth_refresh_token": refresh})
     else:
         raise SystemExit("Use: promo_doctor.py save-password promo-cloud|promobox, or promo_doctor.py save-soundcloud")
     print("Saved." if secret else "Nothing was entered, so nothing was saved.")
@@ -101,7 +109,13 @@ def main():
             print(f"Not ready: {label}, {type(error).__name__}: {str(error)[:200]}. To fix it, {how}.")
     missing = []
     for name, saved, how in platform_logins():
-        if saved:
+        if saved and name == "SoundCloud":
+            try:
+                print(f"Ready: {check_soundcloud()}.")
+            except Exception as error:
+                failed += 1
+                print(f"Not ready: SoundCloud, {type(error).__name__}: {str(error)[:200]}. To fix it, {how}.")
+        elif saved:
             print(f"Saved login: {name}.")
         else:
             missing.append(f"{name}: {how}")
