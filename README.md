@@ -30,7 +30,11 @@ The installer names any other program it needs (ffmpeg, 7-Zip, browser-use) toge
 
 The settings file is JSON. Its keys are listed in the Setup section of `SKILL.md`: the mailbox, the destination folder, the library root used for the duplicate check, the state folder for the local database, logs and saved logins, and optional credential file paths. Set the `PROMO_SETTINGS` environment variable to use a settings file somewhere else.
 
+An optional `exclusion_samples_folder` names a Dropbox folder for examples of unwanted labels. Each update imports their complete `[Label]` names into `audit/exclusions.csv` before collecting. Sister imprints stay separate, and Self Released samples require review. Run `python scripts/promo_exclusions.py` to preview, or add `--apply --sweep` to update the list and clear excluded files from the delivery folder. Sample files are kept and do not count as owned library tracks.
+
 ## Using it
+
+If a playable set folder sits outside `library_root`, include it in the optional `additional_library_roots` array. Each folder gets its own incremental index. DJ order/key prefixes and trailing gain values are ignored for matching, with the original files kept unchanged.
 
 Ask your agent to "update the promos". It will run a dry run first, then collect, and report what was delivered, what was skipped as a duplicate, and what is held for research. The full workflow is in `SKILL.md`.
 

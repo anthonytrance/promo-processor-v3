@@ -17,7 +17,7 @@ import time
 from functools import lru_cache
 from pathlib import Path
 
-from promo_automation import (DEST, HOLD, STATE, TEST_FOLDER_IS_ONE_PASS, Store, dropbox_hash, dropbox_skill, normalized,
+from promo_automation import (DEST, HOLD, STATE, SETTINGS, TEST_FOLDER_IS_ONE_PASS, Store, dropbox_hash, dropbox_skill, normalized,
                               now, process_alive, upload_slot)
 from process_promos import normalize_mix_type
 from audio_length import container
@@ -282,7 +282,7 @@ class VersionIndex:
             self.add(path)
 
     def add(self, path):
-        name = path.rpartition("/")[2]
+        name = library_name(path)
         identity = track_identity(name)
         if identity:
             self.add_known(path, identity[0], identity[1], version_kind(name))
@@ -291,7 +291,7 @@ class VersionIndex:
         self.by_work.setdefault(work, []).append((artists, path, kind))
         self.by_title.setdefault(work.partition("|")[0], []).append((artists, path, kind, work.partition("|")[2]))
 
-    def versions(self, *names):
+    def versions(self, *names, exact_artists=False, credit_typos=False):
         """(path, kind) of each indexed version of the same track; artist lists may differ by a missing co-artist."""
         found = {}
         for name in names:
@@ -299,13 +299,13 @@ class VersionIndex:
             if not identity:
                 continue
             for artists, path, kind in self.by_work.get(identity[1], ()):
-                if artists <= identity[0] or identity[0] <= artists:
+                if artists == identity[0] or (not exact_artists and (artists <= identity[0] or identity[0] <= artists)):
                     found[path] = kind
-            # 2026-10-28: 'Bart Skils x Waska Remix' was in the library as 'Bart Skils & Weska Remix'. A remix
-            # credit one letter away, same artists and title, is a typo of the same mix, not another remixer.
+            # Near remixer spellings are optional audio candidates, never automatic ownership evidence.
             title, _, credit = identity[1].partition("|")
-            for artists, path, kind, other in self.by_title.get(title, ()):
-                if (artists <= identity[0] or identity[0] <= artists) and one_letter_apart(credit, other):
+            for artists, path, kind, other in self.by_title.get(title, ()) if credit_typos else ():
+                if (artists == identity[0] or (not exact_artists and (artists <= identity[0] or identity[0] <= artists))) \
+                        and one_letter_apart(credit, other):
                     found.setdefault(path, kind)
         return list(found.items())
 
@@ -390,10 +390,28 @@ KEY_VERSION = _key_version()
 
 def library_keys(path):
     """(mix, loose, title, artists, work, kind) for one library path; artists and work are None without 'A - T'."""
-    name = path.rpartition("/")[2]
+    name = library_name(path)
     identity = track_identity(name)
     return (mix_key(name), loose_key(name), title_key(name), sorted(identity[0]) if identity else None,
             identity[1] if identity else None, version_kind(name))
+
+
+def library_name(path):
+    """Recognize a set file's order number, Camelot key and trailing gain without changing the file."""
+    name = path.rpartition("/")[2]
+    stem = Path(name).stem
+    match = re.fullmatch(r"[a-z]?\d{1,4}\s+-\s+(?:0?[1-9]|1[0-2])[ab]\s+-\s+(.+ - .+)", stem, re.I)
+    if not match:
+        return name
+    return re.sub(r"\s+-\d+(?:[.,]\d+)?$", "", match.group(1)) + Path(name).suffix
+
+
+def ownership_path(path):
+    """Research holds and rejection samples are not evidence that the user owns a playable mix."""
+    ignored = [HOLD, SETTINGS.get("exclusion_samples_folder")]
+    target = unicodedata.normalize("NFC", path).casefold()
+    return not any(target.startswith(unicodedata.normalize("NFC", folder).casefold().rstrip("/") + "/")
+                   for folder in ignored if folder)
 
 
 class LibraryIndex:
@@ -409,7 +427,7 @@ class LibraryIndex:
         missing = []
         for path, data in store.db.execute("SELECT l.path, k.data FROM library l LEFT JOIN library_keys k "
                                            "ON k.path = l.path AND k.version = ?", (KEY_VERSION,)):
-            if os.path.splitext(path)[1].lower() not in AUDIO_SUFFIXES:
+            if os.path.splitext(path)[1].lower() not in AUDIO_SUFFIXES or not ownership_path(path):
                 continue
             if data is None:
                 keys = library_keys(path)
@@ -736,9 +754,10 @@ def excluded(track, release, rules):
     """Reason this track is on the exclude list, or None."""
     if not rules:
         return None
-    for label in {track.get("label"), release.get("label"), release.get("sender")} - {None, ""}:
-        if normalized(label) in rules["labels"]:
-            return "excluded label: " + label
+    # A credited track imprint outranks a sampler's label. A PR sender is never label evidence.
+    label = track.get("label") or release.get("label")
+    if label and normalized(label) in rules["labels"]:
+        return "excluded label: " + label
     artists = {normalized(a) for a in _ARTIST_SPLIT.split(track.get("artist") or track["name"].split(" - ")[0])}
     hit = artists & set(rules["artists"])
     if hit:

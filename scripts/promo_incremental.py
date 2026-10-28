@@ -16,6 +16,8 @@ from promo_automation import now
 from promo_cloud import protect_json, read_protected_json
 
 MAX_AGE_SECONDS = 30 * 86400
+# Windows file timestamps can lead datetime.now() slightly; bounded skew is not fresh metadata forever.
+CLOCK_SKEW_SECONDS = 1
 MANIFEST_PLATFORMS = {"dropbox", "google-drive", "onedrive", "soundcloud", "disco"}
 PREFIXES = {"promo-cloud": "promo-cloud", "promoly": "promoly", "ampsuite": "ampsuite",
             "label-engine": "labelengine", "promochoons": "promochoons", "disco": "disco",
@@ -91,7 +93,7 @@ class PlanningCache:
         if not path.exists() or not binding.exists():
             return False
         fetched = datetime.fromtimestamp(path.stat().st_mtime, timezone.utc)
-        if not 0 <= (datetime.now(timezone.utc) - fetched).total_seconds() <= MAX_AGE_SECONDS:
+        if not -CLOCK_SKEW_SECONDS <= (datetime.now(timezone.utc) - fetched).total_seconds() <= MAX_AGE_SECONDS:
             return False
         try:
             proof = read_protected_json(binding)
@@ -129,7 +131,7 @@ class PlanningCache:
                 candidate = read_protected_json(path)
                 age = (datetime.now(timezone.utc) - datetime.fromisoformat(candidate["fetched_at"])).total_seconds()
                 if (candidate.get("version") == 1 and candidate.get("signature") == signature
-                        and 0 <= age <= MAX_AGE_SECONDS and complete(candidate.get("release"))):
+                        and -CLOCK_SKEW_SECONDS <= age <= MAX_AGE_SECONDS and complete(candidate.get("release"))):
                     saved = candidate
             except Exception:
                 pass

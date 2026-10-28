@@ -305,6 +305,7 @@ class Store:
         CREATE TABLE IF NOT EXISTS library_cursor(
           singleton INTEGER PRIMARY KEY CHECK(singleton=1), cursor TEXT NOT NULL, listed_at REAL NOT NULL);
         CREATE TABLE IF NOT EXISTS library_keys(path TEXT PRIMARY KEY, version TEXT NOT NULL, data TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS library_extra_cursors(root TEXT PRIMARY KEY, cursor TEXT NOT NULL, listed_at REAL NOT NULL);
         CREATE TABLE IF NOT EXISTS mail_scans(
           folder TEXT, uidvalidity TEXT, uid TEXT, version TEXT NOT NULL, data TEXT NOT NULL,
           PRIMARY KEY(folder,uidvalidity,uid));
@@ -554,6 +555,67 @@ def _library_row(entry):
             normalized(re.sub(r"\s*\[[^]]*\]\s*$", "", Path(entry.name).stem)), now())
 
 
+def index_additional_libraries(store, shared, client, full=False):
+    """Disjoint optional ownership roots, each with its own incremental Dropbox cursor."""
+    import dropbox
+    roots = []
+    for value in SETTINGS.get("additional_library_roots", []):
+        root = value.rstrip("/")
+        if not root.startswith("/") or not root:
+            raise ValueError("Additional library roots must be absolute non-root Dropbox folders")
+        folded = root.casefold()
+        # A nested or parent root would give two cursors control of the same rows.
+        for other in [LIBRARY_ROOT, *roots]:
+            o = other.rstrip("/").casefold()
+            if folded == o or folded.startswith(o + "/") or o.startswith(folded + "/"):
+                raise ValueError("Library roots must not overlap")
+        roots.append(root)
+    active = {r.casefold() for r in roots}
+    for (old,) in store.db.execute("SELECT root FROM library_extra_cursors").fetchall():
+        if old not in active:
+            with store.db:
+                store.db.execute("DELETE FROM library WHERE substr(path,1,?)=?", (len(old) + 1, old + "/"))
+                store.db.execute("DELETE FROM library_extra_cursors WHERE root=?", (old,))
+    reports = []
+    for root in roots:
+        key = root.casefold()
+        saved = store.db.execute("SELECT cursor,listed_at FROM library_extra_cursors WHERE root=?", (key,)).fetchone()
+        incremental = bool(saved) and not full and time.time() - saved["listed_at"] < FULL_RELIST_SECONDS
+        entries, calls = [], 0
+        while True:
+            try:
+                page = (client.files_list_folder_continue(saved["cursor"]) if incremental
+                        else client.files_list_folder(root, recursive=True))
+                calls += 1
+                while True:
+                    entries.extend(page.entries)
+                    if not page.has_more:
+                        break
+                    page = client.files_list_folder_continue(page.cursor)
+                    calls += 1
+                break
+            except dropbox.exceptions.ApiError as error:
+                if incremental and getattr(error.error, "is_reset", lambda: False)():
+                    incremental, entries = False, []
+                    continue
+                raise
+        # Do not advance a cursor or remove its old rows until every page succeeded.
+        with store.db:
+            if not incremental:
+                store.db.execute("DELETE FROM library WHERE substr(path,1,?)=?", (len(key) + 1, key + "/"))
+            for entry in entries:
+                if isinstance(entry, shared.FileMetadata):
+                    store.db.execute("INSERT OR REPLACE INTO library VALUES(?,?,?,?,?,?,?)", _library_row(entry))
+                elif incremental and isinstance(entry, dropbox.files.DeletedMetadata):
+                    path = entry.path_lower
+                    store.db.execute("DELETE FROM library WHERE path=? OR substr(path,1,?)=?",
+                                     (path, len(path) + 1, path + "/"))
+            store.db.execute("INSERT OR REPLACE INTO library_extra_cursors VALUES(?,?,?)",
+                             (key, page.cursor, saved["listed_at"] if incremental else time.time()))
+        reports.append({"root": root, "list_requests": calls, "mode": "changes" if incremental else "full"})
+    return reports
+
+
 def index_library(store, full=False):
     """Mirror every file under LIBRARY_ROOT into the library table.
 
@@ -594,13 +656,19 @@ def index_library(store, full=False):
         else:
             # A file changed during a long listing can appear on two pages; the later entry is the current one.
             files = {e.path_lower: e for e in entries if isinstance(e, shared.FileMetadata)}
-            store.db.execute("DELETE FROM library")
+            root = LIBRARY_ROOT.rstrip("/").casefold()
+            store.db.execute("DELETE FROM library WHERE path=? OR substr(path,1,?)=?",
+                             (root, len(root) + 1, root + "/"))
             store.db.executemany("INSERT INTO library VALUES(?,?,?,?,?,?,?)", [_library_row(e) for e in files.values()])
             store.db.execute("DELETE FROM library_keys WHERE path NOT IN (SELECT path FROM library)")
             store.db.execute("INSERT OR REPLACE INTO library_cursor VALUES(1,?,?)", (page.cursor, time.time()))
+    additional = index_additional_libraries(store, shared, client, full=not incremental)
+    calls += sum(r["list_requests"] for r in additional)
     count = store.db.execute("SELECT count(*) FROM library").fetchone()[0]
     result = {"indexed_files": count, "list_requests": calls, "mode": "changes" if incremental else "full",
               "changes": len(entries) if incremental else None}
+    if additional:
+        result["additional_roots"] = additional
     store.event(None, "library_index", "complete", files=count, list_requests=calls, mode=result["mode"],
                 changes=result["changes"])
     print(json.dumps(result))

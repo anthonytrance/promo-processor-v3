@@ -464,11 +464,13 @@ def phase(args):
     try:
         if args.phase == "prepare":
             from promo_mail import discover
+            from promo_exclusions import sync_samples
             from promo_pipeline import LibraryIndex
+            exclusions = sync_samples(store, apply=True)
             inventory = index_library(store)
             LibraryIndex(store)  # saves keys for new library files once, before parallel lanes need them
             mail = discover(store, f"{args.max_age_days}d", list(PLATFORMS), folders=("INBOX", "Archive"))
-            result = {"library": inventory, "mail": mail, "finished": now()}
+            result = {"library": inventory, "mail": mail, "exclusions": exclusions, "finished": now()}
             save(args.run_dir / "prepare.json", result)
         elif args.phase == "discover":
             result = discover_pass(store, args.platform, args.run_dir, args.max_age_days, args.refresh_metadata)

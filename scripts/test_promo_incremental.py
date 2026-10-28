@@ -3,6 +3,7 @@ from copy import deepcopy
 from datetime import datetime, timedelta, timezone
 import hashlib
 import json
+import os
 from pathlib import Path
 import tempfile
 import unittest
@@ -124,6 +125,37 @@ class IncrementalCacheTests(unittest.TestCase):
         self.assertEqual(self.adapter.snapshots, [False])
         self.assertEqual(self.get()[1]["source"], "cache")
         self.assertEqual(self.adapter.probes, 1)
+
+    def test_microsecond_future_file_timestamp_is_tolerated_but_larger_skew_is_not(self):
+        reference = datetime.now(timezone.utc)
+        class Clock(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return reference
+        for lead, expected in ((.000001, True), (2, False)):
+            with self.subTest(lead=lead):
+                self.adapter.snapshot(self.sid, refresh=True)
+                self.bind_native()
+                moment = reference.timestamp() + lead
+                os.utime(self.adapter.native, (moment, moment))
+                with mock.patch.object(inc, "datetime", Clock):
+                    cache = inc.PlanningCache(self.store, self.adapter, self.adapter.platform)
+                    self.assertEqual(bool(cache._recent_native(self.sid)), expected)
+
+    def test_normalized_cache_tolerates_only_bounded_future_clock_skew(self):
+        self.get()
+        record = json.loads(self.record().read_text())
+        reference = datetime.now(timezone.utc)
+        class Clock(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return reference
+        for lead, expected in ((.000001, "cache"), (2, "fresh")):
+            with self.subTest(lead=lead):
+                record["fetched_at"] = (reference + timedelta(seconds=lead)).isoformat()
+                self.record().write_text(json.dumps(record))
+                with mock.patch.object(inc, "datetime", Clock):
+                    self.assertEqual(self.get()[1]["source"], expected)
 
     def test_no_native_cache_migration_when_a_newer_offer_exists(self):
         self.adapter.snapshot(self.sid, refresh=True)

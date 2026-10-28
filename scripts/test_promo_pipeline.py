@@ -787,7 +787,9 @@ class ReportedDuplicateTests(OwnedVersionTests):
 
     def test_remixer_typo_and_x_separator_are_the_same_mix(self):
         owned = ["/music library/promos/2026/09/soul central - strings of life un amore supremo (bart skils & weska remix) [drumcode].aif"]
-        self.assertEqual(self.decide("Soul Central - Strings Of Life - Un Amore Supremo (Bart Skils x Waska Remix)", owned), "skip")
+        offered = "Soul Central - Strings Of Life - Un Amore Supremo (Bart Skils x Waska Remix)"
+        self.assertEqual(self.decide(offered, owned), "download", "a remixer typo needs audio evidence, not an automatic skip")
+        self.assertTrue(pipeline.VersionIndex(owned).versions(offered, credit_typos=True))
         self.assertEqual(self.decide("Soul Central - Strings Of Life - Un Amore Supremo (Joris Voorn Remix)", owned), "download")
         self.assertFalse(pipeline.one_letter_apart("aly", "ali"))
         self.assertFalse(pipeline.one_letter_apart("2026 part 1", "2026 part 2"))

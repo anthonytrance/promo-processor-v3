@@ -11,14 +11,15 @@ import unicodedata
 from mutagen import File as MutagenFile
 
 from promo_automation import DEST, HOLD, atomic_text, dropbox_hash, dropbox_skill, index_library, now
-from promo_pipeline import AUDIO_SUFFIXES, LOSSY_SUFFIXES, loose_key, mix_key, probe, tag_mismatches, validate_audio
+from promo_pipeline import (AUDIO_SUFFIXES, LOSSY_SUFFIXES, loose_key, mix_key, ownership_path, probe,
+                            tag_mismatches, validate_audio)
 from process_promos import (apply_typo_corrections, build_target_filename, clean_master_suffixes,
                            normalize_ft_to_feat, normalize_mix_type, parse_filename,
                            read_existing_tags, verify_tags)
 
 
 # Bump when a filename, tag or audio rule changes, so earlier passes are checked again.
-AUDIT_RULES = "2026-10-28b"
+AUDIT_RULES = "2026-10-28c"
 
 
 def nfc(value):
@@ -74,7 +75,7 @@ def pcm_identity(path):
     """An exact decoded-audio digest, independent of WAV/AIFF container and tags."""
     info = probe(path)
     result = subprocess.run(["ffmpeg", "-v", "error", "-i", str(path), "-map", "0:a:0", "-vn",
-                             "-c:a", "pcm_s32le", "-f", "hash", "-hash", "sha256", "-"],
+                             "-c:a", "pcm_f64le", "-f", "hash", "-hash", "sha256", "-"],
                             capture_output=True, text=True, timeout=300, check=True)
     return {"sha256": result.stdout.strip().split("=", 1)[-1], "sample_rate": info["sample_rate"],
             "channels": info["channels"]}
@@ -108,7 +109,7 @@ def remove_test_copy(store, client, remote, reason, original):
         store.db.execute("DELETE FROM library WHERE remote_id=?", (remote.id,))
         for asset in store.db.execute("SELECT asset_key,dropbox_path FROM assets WHERE dropbox_path IS NOT NULL").fetchall():
             if nfc(asset["dropbox_path"]).casefold() == nfc(path).casefold():
-                store.db.execute("UPDATE assets SET stage=?,updated_at=? WHERE asset_key=?",
+                store.db.execute("UPDATE assets SET stage=?,dropbox_path=NULL,local_path=NULL,updated_at=? WHERE asset_key=?",
                                  ("excluded_existing_library", now(), asset["asset_key"]))
     store.event(None, "final_audit", "test_copy_removed", path=remote.path_display, reason=reason,
                 existing_library_path=original)
@@ -134,11 +135,11 @@ def resolution_and_version_issues(store, name, test_names, duration=None, owned=
     kind = version_kind(name)
     longer = lambda k: (k == "extended" and kind != "extended") or (k == "full" and kind == "short")
     tests = test_names if isinstance(test_names, VersionIndex) else VersionIndex(test_names)
-    if any(longer(k) for p, k in tests.versions(name) if nfc(Path(p).name).casefold() != nfc(name).casefold()):
+    if any(longer(k) for p, k in tests.versions(name, exact_artists=True) if nfc(Path(p).name).casefold() != nfc(name).casefold()):
         issues.append("Shorter version; a longer version of the same track is in the test folder")
     owned = owned if isinstance(owned, VersionIndex) or owned is None else VersionIndex(owned)
     # An unmarked library copy of an extended mix is the same track (2026-10-28, Amos & Riot Night).
-    hits = [p for p, k in (owned.versions(name) if owned else [])
+    hits = [p for p, k in (owned.versions(name, exact_artists=True) if owned else [])
             if longer(k) or k == kind or (kind == "extended" and k == "full" and unmarked_name(p))]
     if hits:
         issues.append("Same track already in the library in this or a longer version: " + hits[0])
@@ -155,7 +156,7 @@ def audit(store, run_dir):
             if Path(r["path"]).suffix.lower() in AUDIO_SUFFIXES]
     # Needs Research holds files that are known not to be final; they are neither audited nor duplicates of anything.
     tests = [r for r in rows if r["path"].startswith(DEST.lower() + "/") and not r["path"].startswith(HOLD.lower() + "/")]
-    others = [r for r in rows if not r["path"].startswith(DEST.lower() + "/")]
+    others = [r for r in rows if not r["path"].startswith(DEST.lower() + "/") and ownership_path(r["path"])]
     by_key, by_candidate, by_hash = defaultdict(list), defaultdict(list), defaultdict(list)
     for row in others:
         by_key[mix_key(Path(row["path"]).name)].append(row)
@@ -183,6 +184,8 @@ def audit(store, run_dir):
     from promo_pipeline import VersionIndex
     test_names = VersionIndex(Path(t["path"]).name for t in tests)
     owned = VersionIndex(r["path"] for r in others)
+    compared_versions = VersionIndex(r["path"] for r in others)
+    compared_rows = {r["path"]: r for r in others}
     for row in tests:
         entry = {"path": row["path"], "state": "checking"}
         report["current"] = entry
@@ -194,15 +197,21 @@ def audit(store, run_dir):
             # resolution (154 on 2026-10-24) to a full download each audit. A capitalization-only resolution approved
             # after a revision passed is caught by the full check after the next AUDIT_RULES bump.
             name = Path(row["path"]).name
+            # Credits such as '(Guest Extended Remix)' and '(Guest - Extended Mix)', missing co-artists,
+            # or two trailing label brackets can miss the old string keys. These are audio candidates only.
+            # Different audio here never proves a duplicate or creates a research hold by itself.
+            audio_candidates = [compared_rows[p] for p, _ in compared_versions.versions(name, credit_typos=True)]
             stamp = ":".join((AUDIT_RULES, row["remote_id"], row["revision"], row["content_hash"]))
             if stamp in passed and not (by_hash.get(row["content_hash"]) or by_key.get(mix_key(name))
-                                        or by_candidate.get(candidate_key(name))) \
+                                        or by_candidate.get(candidate_key(name)) or audio_candidates) \
                     and not resolution_and_version_issues(store, name, test_names, owned=owned, lowercase_name=True):
                 entry.update(name=name, revision=row["revision"], content_hash=row["content_hash"],
                              state="verified", cached=True)
                 by_key[mix_key(name)].append(row)
                 by_candidate[candidate_key(name)].append(row)
                 by_hash[row["content_hash"]].append(row)
+                compared_versions.add(row["path"])
+                compared_rows[row["path"]] = row
                 report["files"].append(entry)
                 report.pop("current", None)
                 checkpoint()
@@ -224,6 +233,8 @@ def audit(store, run_dir):
                     issues.append("Source precision or channels were changed")
             candidates = {r["remote_id"]: r for r in by_hash.get(remote.content_hash, [])
                           + by_key.get(mix_key(remote.name), []) + by_candidate.get(candidate_key(remote.name), [])}
+            strict_ids = set(candidates)
+            candidates.update({r["remote_id"]: r for r in audio_candidates})
             duplicate = None
             different_audio = []
             own_pcm = None
@@ -239,7 +250,8 @@ def audit(store, run_dir):
                     duplicate = original
                     entry["duplicate_evidence"] = "identical decoded audio, sample rate and channels"
                     break
-                different_audio.append(original.path_display)
+                if match["remote_id"] in strict_ids:
+                    different_audio.append(original.path_display)
             if duplicate:
                 remove_test_copy(store, client, remote, entry["duplicate_evidence"], duplicate.path_display)
                 entry.update(state="removed_duplicate", existing_library_path=duplicate.path_display)
@@ -259,6 +271,8 @@ def audit(store, run_dir):
                 by_key[mix_key(remote.name)].append(row)
                 by_candidate[candidate_key(remote.name)].append(row)
                 by_hash[remote.content_hash].append(row)
+                compared_versions.add(row["path"])
+                compared_rows[row["path"]] = row
         except Exception as error:
             entry.update(state="audit_exception", error=type(error).__name__ + ": " + str(error)[:200])
         finally:
