@@ -17,7 +17,7 @@ import time
 from functools import lru_cache
 from pathlib import Path
 
-from promo_automation import (DEST, HOLD, STATE, SETTINGS, TEST_FOLDER_IS_ONE_PASS, Store, dropbox_hash, dropbox_skill, normalized,
+from promo_automation import (AUDIT, DEST, HOLD, STATE, SETTINGS, TEST_FOLDER_IS_ONE_PASS, Store, dropbox_hash, dropbox_skill, normalized,
                               now, process_alive, upload_slot)
 from process_promos import normalize_mix_type
 from audio_length import container
@@ -33,7 +33,7 @@ RESUMABLE_STAGES = {"downloaded", "processed"}
 EXCLUSIONS = STATE / "exclusions.json"  # legacy list, read only when no CSV was ever fetched
 # 2026-10-24: the master exclusion list is a CSV the user edits in the audit folder. Each process reads it once
 # per EXCLUSIONS_TTL seconds and keeps the last good copy locally, so a Dropbox hiccup never lifts an exclusion.
-EXCLUSIONS_REMOTE = DEST + "/audit/exclusions.csv"
+EXCLUSIONS_REMOTE = AUDIT + "/exclusions.csv"
 EXCLUSIONS_CACHE = STATE / "exclusions.csv"
 EXCLUSIONS_TTL = 300
 _EXCLUSIONS_LOADED = {}
@@ -589,6 +589,9 @@ def inventory_key(store, name):
 def delivered_lossy_this_pass(store, row):
     if not row["dropbox_path"] or Path(row["dropbox_path"]).suffix.lower() not in LOSSY_SUFFIXES:
         return False
+    if not any(row["dropbox_path"].casefold().startswith(folder.casefold().rstrip("/") + "/")
+               for folder in (DEST, HOLD)):
+        return False  # A continued pass never grants replacement rights in an archived month.
     if TEST_FOLDER_IS_ONE_PASS and row["dropbox_path"].casefold().startswith(DEST.casefold() + "/"):
         return True
     started = store.pass_started()

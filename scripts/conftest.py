@@ -17,3 +17,4 @@ def offline_exclusions(monkeypatch, tmp_path):
     monkeypatch.setattr(promo_pipeline, "EXCLUSIONS_CACHE", tmp_path / "no-exclusions.csv")
     monkeypatch.delitem(promo_automation.SETTINGS, "additional_library_roots", raising=False)
     monkeypatch.delitem(promo_automation.SETTINGS, "exclusion_samples_folder", raising=False)
+    monkeypatch.delitem(promo_automation.SETTINGS, "archive_root", raising=False)

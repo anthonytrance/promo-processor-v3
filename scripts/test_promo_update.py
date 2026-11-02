@@ -1,4 +1,5 @@
 import hashlib
+from contextlib import closing
 import json
 from pathlib import Path
 import tempfile
@@ -17,6 +18,30 @@ from process_promos import write_tags
 
 
 class PassTests(unittest.TestCase):
+    def test_archive_failure_blocks_preparation_before_mail_or_collection(self):
+        with mock.patch.object(update, "Store") as store, \
+                mock.patch("promo_archive.rotate_month", side_effect=RuntimeError("archive conflict")), \
+                mock.patch("promo_mail.discover") as mail, \
+                mock.patch("promo_exclusions.sync_samples") as exclusions:
+            with self.assertRaisesRegex(RuntimeError, "archive conflict"):
+                update.phase(SimpleNamespace(phase="prepare"))
+            mail.assert_not_called()
+            exclusions.assert_not_called()
+            store.return_value.db.close.assert_called_once()
+
+    def test_summary_tells_the_user_where_the_previous_month_went(self):
+        with tempfile.TemporaryDirectory() as root:
+            store = Store(root)
+            with closing(store.db):
+                run = Path(root)
+                write(run / "run.json", {"started": "2026-11-01", "destination": "/Music/Latest"})
+                archived = {"state": "archived", "files": 3, "path": "/Music/2026/10"}
+                write(run / "prepare.json", {"archive": archived})
+                with mock.patch.object(update, "STATE", run):
+                    result = update.summary(store, run, ())
+                self.assertEqual(result["archive"], archived)
+                self.assertIn("Archived 3 previous files to /Music/2026/10", result["text"])
+
     def test_continue_pass_joins_the_previous_run_only_when_asked(self):
         with tempfile.TemporaryDirectory() as root:
             store = Store(root)
@@ -92,7 +117,7 @@ class FinalAuditTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as root:
             store = Store(root)
             client = mock.Mock()
-            remote = SimpleNamespace(id="id:one", rev="rev1", name="A.aiff", path_lower="/music library/promos/latest promos/a.aiff", path_display="/Music Library/Promos/Latest Promos/A.aiff")
+            remote = SimpleNamespace(id="id:one", rev="rev1", name="A.aiff", path_lower="/library/archive/a.aiff", path_display="/Library/Archive/A.aiff")
             with self.assertRaises(ValueError):
                 audit.remove_test_copy(store, client, remote, "duplicate", "/existing")
             with self.assertRaises(ValueError):

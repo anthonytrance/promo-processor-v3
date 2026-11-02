@@ -40,17 +40,16 @@ SETTINGS = load_settings()
 LOCAL = Path(os.environ.get("LOCALAPPDATA") or Path.home() / "AppData/Local")
 STATE = Path(SETTINGS.get("state_dir") or LOCAL / "promo-processor/state")
 DEST = SETTINGS.get("destination", "/Music/Promos")
+AUDIT = SETTINGS.get("audit_folder") or DEST + "/audit"
 # The whole library, listed for the duplicate check; DEST sits inside it.
 LIBRARY_ROOT = SETTINGS.get("library_root") or "/" + DEST.strip("/").split("/")[0]
 ACCOUNT = SETTINGS.get("mail_account", "")
 # Keyring service holding the platform passwords and saved logins.
 CREDENTIAL_SERVICE = SETTINGS.get("credential_service", "promo-processor")
 # Held files wait here with a note, instead of on this computer; never merged until fixed and moved up.
-HOLD = DEST + "/Needs Research"
-# 2026-10-24: nothing in the test folder has been processed by the user yet, so the whole test folder counts as
-# one pass and a lossless copy may replace any lossy copy in it. Set to False when delivery moves to Latest Promos;
-# from then on each "update the promos" is its own pass and earlier passes are never replaced.
-TEST_FOLDER_IS_ONE_PASS = True
+HOLD = SETTINGS.get("hold_folder") or AUDIT + "/Needs Research"
+# Production runs are separate passes. A private test installation can explicitly opt into the old policy.
+TEST_FOLDER_IS_ONE_PASS = SETTINGS.get("test_folder_is_one_pass", False)
 # The full download logs hold every event ever (about 9 MB each on 2026-10-24) and were re-uploaded each minute:
 # 3.5 GB and 40 minutes of transfer in one day. They now refresh at most every SUMMARY_SECONDS when a worker
 # finishes, and always in the run's summary phase.
@@ -435,7 +434,7 @@ class Store:
         writer = csv.writer(output)
         writer.writerow(["UTC", "Platform", "Release ID", "Promo", "Action", "Status", "Details"])
         lines = ["PROMO DOWNLOAD LOG", "Updated: " + now(),
-                 "Test folder: " + DEST,
+                 "Music folder: " + DEST,
                  "Views and downloads can change platform indicators. Check each event below.",
                  "Only delivery_verified confirms a processed file exists in Dropbox.",
                  "An intent or uncertain result must not be interpreted as a completed download.", ""]
@@ -444,13 +443,13 @@ class Store:
             # Keep spreadsheet formula injection out of the human-facing CSV.
             writer.writerow(["'" + str(v) if str(v).startswith(("=", "+", "-", "@")) else v for v in values])
             lines.append(" | ".join(str(v) for v in values))
-        readme = ("PROMO DOWNLOADS\n\nPromos collected by the promo automation live here.\n"
+        readme = ("PROMO AUDIT\n\nMusic folder: " + DEST + "\n"
                   "The download_log.txt and download_log.csv files identify viewed promos, download attempts, "
                   "feedback, processing, delivery and any uncertain state.\n"
                   "A platform may mark a promo read/downloaded before a transfer or upload has completed. "
                   "Use delivery_verified entries to find the final processed files.\n"
                   "Failed or uncertain entries remain outstanding and must not be silently skipped.\n"
-                  "The audit subfolder receives event batches about every minute while a run works. Human-readable "
+                  "This audit folder receives event batches about every minute while a run works. Human-readable "
                   "log summaries refresh at most every 15 minutes and at the end of every run.\n")
         return {"download_log.csv": output.getvalue().encode("utf-8"),
                 "download_log.txt": ("\n".join(lines) + "\n").encode("utf-8"),
@@ -484,13 +483,12 @@ class Store:
                        coalesce(s.subject,'') promo,e.action,e.status,e.details FROM events e
                        LEFT JOIN sources s ON s.id=e.source_id WHERE e.sequence>? ORDER BY e.sequence""", (published,)).fetchall()
             shared, client = dropbox_skill()
+            if not getattr(self, "_audit_folder_ready", False):
+                shared.ensure_dropbox_folder(client, AUDIT)
+                self._audit_folder_ready = True
             if rows and events_due:
                 data = ("\n".join(json.dumps(dict(row), ensure_ascii=False) for row in rows) + "\n").encode("utf-8")
-                audit_folder = DEST + "/audit"
-                if not getattr(self, "_audit_folder_ready", False):
-                    shared.ensure_dropbox_folder(client, audit_folder)
-                    self._audit_folder_ready = True
-                target = audit_folder + f"/events-{rows[0]['sequence']:09d}-{rows[-1]['sequence']:09d}.jsonl"
+                target = AUDIT + f"/events-{rows[0]['sequence']:09d}-{rows[-1]['sequence']:09d}.jsonl"
                 wanted = dropbox_bytes_hash(data)
                 try:
                     remote = client.files_upload(data, target, mode=dropbox.files.WriteMode.add,
@@ -513,7 +511,7 @@ class Store:
                     prior = self.db.execute("SELECT content_hash FROM log_files WHERE name=?", (name,)).fetchone()
                     if prior and prior[0] == wanted:
                         continue
-                    remote = client.files_upload(data, DEST + "/" + name, mode=dropbox.files.WriteMode.overwrite, mute=True)
+                    remote = client.files_upload(data, AUDIT + "/" + name, mode=dropbox.files.WriteMode.overwrite, mute=True)
                     if remote.content_hash != wanted:
                         raise RuntimeError("Shared summary upload hash differs")
                     transferred += len(data)

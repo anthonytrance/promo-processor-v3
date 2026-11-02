@@ -426,7 +426,11 @@ def summary(store, run_dir, platforms=PLATFORMS):
         lines.append("Run phases that failed: " + "; ".join(
             (step.get("platform") + " " if step.get("platform") else "") + str(step.get("phase"))
             for step in phase_failures) + ". Source coverage is incomplete; see the phase logs.")
-    mail = load(run_dir / "prepare.json", {}).get("mail", {})
+    prepared = load(run_dir / "prepare.json", {})
+    result["archive"] = prepared.get("archive", {})
+    if result["archive"].get("state") == "archived":
+        lines.append(f"Archived {result['archive']['files']} previous files to {result['archive']['path']} before collecting.")
+    mail = prepared.get("mail", {})
     result["platforms_without_adapter"] = mail.get("platforms_without_adapter", {})
     result["unrecognised_promo_mails"] = mail.get("unrecognised_promo_mails", [])
     if result["platforms_without_adapter"]:
@@ -463,14 +467,16 @@ def phase(args):
     store = Store()
     try:
         if args.phase == "prepare":
+            from promo_archive import rotate_month
             from promo_mail import discover
             from promo_exclusions import sync_samples
             from promo_pipeline import LibraryIndex
+            archive = rotate_month(store)
             exclusions = sync_samples(store, apply=True)
             inventory = index_library(store)
             LibraryIndex(store)  # saves keys for new library files once, before parallel lanes need them
             mail = discover(store, f"{args.max_age_days}d", list(PLATFORMS), folders=("INBOX", "Archive"))
-            result = {"library": inventory, "mail": mail, "exclusions": exclusions, "finished": now()}
+            result = {"archive": archive, "library": inventory, "mail": mail, "exclusions": exclusions, "finished": now()}
             save(args.run_dir / "prepare.json", result)
         elif args.phase == "discover":
             result = discover_pass(store, args.platform, args.run_dir, args.max_age_days, args.refresh_metadata)
@@ -640,7 +646,7 @@ def main():
     parser.add_argument("--refresh-metadata", action="store_true", help="force fresh release inspection during discovery")
     args = parser.parse_args()
     if args.max_age_days < 1 or args.max_age_days > 30:
-        parser.error("This test update is limited to the authorized recent 30-day window")
+        parser.error("This update is limited to the authorized recent 30-day window")
     if not 1 <= args.lanes <= 6:
         parser.error("--lanes must be between 1 and 6")
     if args.phase in {"discover", "collect", "reconcile"} and not args.platform:

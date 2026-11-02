@@ -184,6 +184,9 @@ class DecisionTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.store = Store(self.tmp.name)
+        patch = mock.patch.object(pipeline, "DEST", "/test")
+        patch.start()
+        self.addCleanup(patch.stop)
 
     def tearDown(self):
         self.store.db.close()
@@ -238,10 +241,16 @@ class DecisionTests(unittest.TestCase):
         self.store.start_pass("2999-01-01T00:00:00+00:00")
         self.assertEqual(pipeline.decide(self.store, self.fake_library([]), "k", self.offer("wav"))[0], "upgrade_candidate")
 
+    def test_continued_pass_never_replaces_an_archived_copy(self):
+        self.store.start_pass("2000-01-01T00:00:00+00:00")
+        self.deliver_lossy(path="/archive/2026/10/A - Song [X].mp3")
+        self.assertEqual(pipeline.decide(self.store, self.fake_library([]), "k", self.offer("wav"))[0], "upgrade_candidate")
+
     def test_test_folder_counts_as_one_pass_until_production(self):
         self.deliver_lossy(path=pipeline.DEST + "/A - Song (Original Mix) [X].mp3")
         self.store.start_pass("2999-01-01T00:00:00+00:00")
-        self.assertEqual(pipeline.decide(self.store, self.fake_library([]), "k", self.offer("wav"))[0], "replace")
+        with mock.patch.object(pipeline, "TEST_FOLDER_IS_ONE_PASS", True):
+            self.assertEqual(pipeline.decide(self.store, self.fake_library([]), "k", self.offer("wav"))[0], "replace")
         with mock.patch.object(pipeline, "TEST_FOLDER_IS_ONE_PASS", False):
             self.assertEqual(pipeline.decide(self.store, self.fake_library([]), "k", self.offer("wav"))[0], "upgrade_candidate")
 

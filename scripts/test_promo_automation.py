@@ -84,6 +84,7 @@ class LogSyncTests(unittest.TestCase):
                 store.sync_logs(summary=True)
                 self.assertEqual(len(calls), 6, "unchanged summaries are not uploaded again")
                 self.assertEqual(len([c for c in calls if c.endswith("README.txt")]), 1)
+                self.assertTrue(all(c.startswith(promo_automation.AUDIT + "/") for c in calls))
             self.assertEqual(store.db.execute("SELECT published_sequence FROM log_checkpoint").fetchone()[0], 4)
             store.db.close()
 
