@@ -222,6 +222,26 @@ class CoordinatorTests(unittest.TestCase):
             self.assertEqual(set(defer["promoly"]["p1"]), {"B - Tune"})
             self.assertNotIn("fatdrop", defer)
 
+    def test_radio_edit_from_another_promo_gives_way_to_the_extended_mix_this_run(self):
+        with tempfile.TemporaryDirectory() as root:
+            run = Path(root)
+            # The radio edit's promo is planned first, so ordering luck cannot let it through.
+            write(run / "inflyte-plan.json", {"releases": [
+                {**planned("i1"), "plan": {"tracks": [
+                    {"track": "A - Song", "action": "download", "format": "wav", "seconds": 190},
+                    {"track": "B - Tune (Radio Edit)", "action": "download", "format": "wav", "seconds": 180},
+                    {"track": "C - Long", "action": "download", "format": "wav", "seconds": 420},
+                    {"track": "D - Thing (Original Mix)", "action": "download", "format": "wav", "seconds": 300},
+                    {"track": "E - Unknown", "action": "download", "format": "wav"}]}}]})
+            write(run / "promoly-plan.json", {"releases": [
+                {**planned("p1"), "plan": {"tracks": [
+                    {"track": f"{name} (Extended Mix)", "action": "download", "format": "mp3", "seconds": 330}
+                    for name in ("A - Song", "B - Tune", "C - Long", "D - Thing", "E - Unknown")]}}]})
+            update.plan_globally(run, ("inflyte", "promoly"))
+            defer = json.loads((run / "global-plan.json").read_text(encoding="utf-8"))["defer"]
+            self.assertEqual(set(defer["inflyte"]["i1"]), {"A - Song", "B - Tune (Radio Edit)", "E - Unknown"})
+            self.assertNotIn("promoly", defer, "the extended mix is never deferred for a shorter version")
+
     def test_collect_applies_deferrals_skips_idle_releases_and_reconcile_ignores_deferrals(self):
         with tempfile.TemporaryDirectory() as root:
             run = Path(root)

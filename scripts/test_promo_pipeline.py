@@ -713,8 +713,17 @@ class OwnedVersionTests(unittest.TestCase):
     def test_extended_beside_owned_original_is_asked_not_delivered(self):
         earlier = ["/music library/09/sikoti - fall back into you (original mix) [x].aiff"]
         self.assertEqual(self.decide("Sikoti - Fall Back Into You (Extended Mix)", earlier), "upgrade_candidate")
-        this_pass = [pipeline.DEST.lower() + "/sikoti - fall back into you (original mix) [x].aiff"]
-        self.assertEqual(self.decide("Sikoti - Fall Back Into You (Extended Mix)", this_pass), "download")
+        latest = [pipeline.DEST.lower() + "/sikoti - fall back into you (original mix) [x].aiff"]
+        self.assertEqual(self.decide("Sikoti - Fall Back Into You (Extended Mix)", latest), "upgrade_candidate",
+                         "Latest Promos holds earlier runs of the month too")
+        self.delivered_now(pipeline.DEST + "/Sikoti - Fall Back Into You (Original Mix) [X].aiff")
+        self.assertEqual(self.decide("Sikoti - Fall Back Into You (Extended Mix)", latest), "download")
+
+    def delivered_now(self, path):
+        self.store.start_pass()
+        sid = self.store.add_source("inflyte", "Release", "https://inflyte.invalid/" + path)
+        self.store.claim(path, sid, Path(path).stem, "wav")
+        self.store.asset_update(path, "delivery_verified", dropbox_path=path)
 
     def test_spelling_variants_of_owned_tracks_are_skipped(self):
         owned = ["/music library/09/22bullets feat. anticalm - my motto (extended mix) [x].aiff",
@@ -783,11 +792,32 @@ class ExclusionCsvTests(unittest.TestCase):
 class ReportedDuplicateTests(OwnedVersionTests):
     """2026-10-28: duplicates and names the user found in the test folder."""
 
-    def test_unmarked_library_copy_owns_the_extended_mix(self):
+    def test_unmarked_library_copy_of_the_same_length_owns_the_extended_mix(self):
         owned = ["/music library/promos/latest promos/amos & riot night x bryce keuris x aylin aloski - loved in silence [fsoe].aiff"]
-        self.assertEqual(self.decide("Amos & Riot Night, Bryce Keuris & Aylin Aloski - Loved in Silence (Extended Mix)", owned), "skip")
-        this_pass = [pipeline.DEST.lower() + "/amos & riot night - loved in silence [fsoe].aiff"]
-        self.assertEqual(self.decide("Amos & Riot Night - Loved in Silence (Extended Mix)", this_pass), "download")
+        offered = "Amos & Riot Night, Bryce Keuris & Aylin Aloski - Loved in Silence (Extended Mix)"
+        with mock.patch.object(pipeline, "owned_seconds", return_value=331.5):
+            self.assertEqual(self.decide(offered, owned, seconds=333), "skip")
+        # 2026-11-03: an earlier run got only the radio edit, without a mix name; the extended mix still comes in.
+        with mock.patch.object(pipeline, "owned_seconds", return_value=195.0):
+            self.assertEqual(self.decide(offered, owned, seconds=333), "download")
+        with mock.patch.object(pipeline, "owned_seconds", return_value=None):
+            self.assertEqual(self.decide(offered, owned, seconds=333), "uncertain", "no guessing without both lengths")
+        with mock.patch.object(pipeline, "owned_seconds", return_value=331.5):
+            self.assertEqual(self.decide(offered, owned, seconds=None), "uncertain")
+
+    def test_owned_length_is_read_from_the_file_header_once_per_content_hash(self):
+        import struct
+        path = "/music library/09/a - song [x].wav"
+        header = b"RIFF" + struct.pack("<I", 0) + b"WAVE" + b"fmt " + struct.pack("<I", 16) + \
+            struct.pack("<HHIIHH", 1, 2, 44100, 176400, 4, 16) + b"data" + struct.pack("<I", 176400 * 200)
+        self.store.db.execute("INSERT INTO library(path,bytes,content_hash) VALUES(?,?,?)",
+                              (path, len(header) + 176400 * 200, "hash1"))
+        response = mock.Mock(iter_content=lambda size: iter([header + bytes(70000)]))
+        client = mock.Mock(files_download=mock.Mock(return_value=(None, response)))
+        with mock.patch.object(pipeline, "_DROPBOX", [client]):
+            self.assertAlmostEqual(pipeline.owned_seconds(self.store, path), 200.0)
+            self.assertAlmostEqual(pipeline.owned_seconds(self.store, path), 200.0)
+        client.files_download.assert_called_once_with(path)
 
     def test_dj_version_is_the_extended_mix(self):
         owned = ["/music library/promos/latest promos/david broaders - polylith (dj version) [euphonic].mp3"]

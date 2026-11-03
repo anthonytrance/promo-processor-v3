@@ -304,6 +304,7 @@ class Store:
         CREATE TABLE IF NOT EXISTS library_cursor(
           singleton INTEGER PRIMARY KEY CHECK(singleton=1), cursor TEXT NOT NULL, listed_at REAL NOT NULL);
         CREATE TABLE IF NOT EXISTS library_keys(path TEXT PRIMARY KEY, version TEXT NOT NULL, data TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS library_lengths(content_hash TEXT PRIMARY KEY, seconds REAL NOT NULL);
         CREATE TABLE IF NOT EXISTS library_extra_cursors(root TEXT PRIMARY KEY, cursor TEXT NOT NULL, listed_at REAL NOT NULL);
         CREATE TABLE IF NOT EXISTS mail_scans(
           folder TEXT, uidvalidity TEXT, uid TEXT, version TEXT NOT NULL, data TEXT NOT NULL,

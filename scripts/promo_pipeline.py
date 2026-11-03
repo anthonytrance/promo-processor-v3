@@ -20,7 +20,7 @@ from pathlib import Path
 from promo_automation import (AUDIT, DEST, HOLD, STATE, SETTINGS, TEST_FOLDER_IS_ONE_PASS, Store, dropbox_hash, dropbox_skill, normalized,
                               now, process_alive, upload_slot)
 from process_promos import normalize_mix_type
-from audio_length import container
+from audio_length import container, length_from_stream
 
 SCRIPTS = Path(__file__).resolve().parent
 STAGING = STATE / "staging"
@@ -598,6 +598,43 @@ def delivered_lossy_this_pass(store, row):
     return bool(started and row["updated_at"] >= started)
 
 
+def delivered_this_pass(store, path):
+    """A library file this run delivered itself, so a better version of it may still come in this run."""
+    started = store.pass_started()
+    return bool(started) and any(row[0].casefold() == path.casefold() for row in store.db.execute(
+        "SELECT dropbox_path FROM assets WHERE dropbox_path IS NOT NULL AND updated_at >= ?", (started,)))
+
+
+SAME_LENGTH_SECONDS = 10.0
+_DROPBOX = []
+
+
+def owned_seconds(store, path):
+    """Length of a library file from the first bytes of its Dropbox copy, cached per content hash; None if unknown."""
+    row = store.db.execute("SELECT content_hash, bytes FROM library WHERE path=?", (path,)).fetchone()
+    if row is None or not row["bytes"]:
+        return None
+    if row["content_hash"]:
+        cached = store.db.execute("SELECT seconds FROM library_lengths WHERE content_hash=?", (row["content_hash"],)).fetchone()
+        if cached:
+            return cached[0]
+    try:
+        if not _DROPBOX:
+            _DROPBOX.append(dropbox_skill()[1])
+        _, response = _DROPBOX[0].files_download(path)
+        try:
+            length = length_from_stream(response.iter_content(1 << 14), row["bytes"])
+        finally:
+            response.close()
+    except Exception as error:
+        store.event(None, "length_probe", "failed", file=path, error=str(error)[:200])
+        return None
+    if length and row["content_hash"]:
+        store.db.execute("INSERT OR REPLACE INTO library_lengths VALUES(?,?)", (row["content_hash"], length))
+        store.db.commit()
+    return length
+
+
 def _not_found(error):
     """Dropbox metadata and delete errors wrap the same lookup error under different names."""
     detail = error.error
@@ -668,19 +705,34 @@ def decide(store, library, key, offer, asset_key=None):
         owned = owned.versions(*names) if isinstance(owned, VersionIndex) else []
         longer = [p for p, k in owned if (k == "extended" and kind != "extended") or (k == "full" and kind == "short")]
         same = [p for p, k in owned if k == kind or (k == "dj" and kind == "short")]
-        # 2026-10-28: an unmarked library copy is usually the extended mix under a store-less name
-        # ('Amos & Riot Night x ... - Loved In Silence [FSOE]' beside the offered Extended Mix), so it counts as owned.
-        # The same unmarked name delivered in this test pass still gives way to the extended mix.
-        unmarked = [p for p, k in owned if k == "full" and kind == "extended" and unmarked_name(p)
-                    and not p.lower().startswith(DEST.lower() + "/")]
-        if longer or unmarked:
-            return "skip", "a longer version of this track is already in library", {"library": (longer or unmarked)[:3]}
+        if longer:
+            return "skip", "a longer version of this track is already in library", {"library": longer[:3]}
         if same:
             found = same
         elif kind == "extended" and owned:
-            earlier = [p for p, k in owned if k == "full" and not p.lower().startswith(DEST.lower() + "/")]
+            # 2026-11-03: an unmarked library copy is either the extended mix under a store-less name or a radio edit
+            # without a name. The lengths decide: the same length is owned, a clearly shorter copy was the radio edit
+            # of an earlier run and the extended mix still comes in. An unknown length is left for the user.
+            unmarked = [p for p, k in owned if k == "full" and unmarked_name(p)]
+            if unmarked:
+                offered = seconds(offer.get("duration"))
+                lengths = {p: owned_seconds(store, p) for p in unmarked}
+                if not offered or not all(lengths.values()):
+                    return "uncertain", "an unmarked version is in library and the lengths cannot be compared; needs review", \
+                        {"library": unmarked[:3], "offered_seconds": offered,
+                         "library_seconds": [lengths[p] for p in unmarked[:3]]}
+                same_length = [p for p in unmarked if lengths[p] >= offered - SAME_LENGTH_SECONDS]
+                if same_length:
+                    return "skip", "an unmarked copy of the same length is already in library", \
+                        {"library": same_length[:3], "offered_seconds": offered,
+                         "library_seconds": [lengths[p] for p in same_length[:3]]}
+            # An explicit Original from an earlier run is reported, never delivered over; from this run it gives way.
+            earlier = [p for p, k in owned if k == "full" and not unmarked_name(p) and not delivered_this_pass(store, p)]
             if earlier:
-                return "upgrade_candidate", "library has the Original or unmarked version; extended mix offered", {"library": earlier[:3]}
+                return "upgrade_candidate", "library has the Original version; extended mix offered", {"library": earlier[:3]}
+            if unmarked:
+                return "download", "the unmarked library copy is shorter, a radio edit; extended mix offered", \
+                    {"library": unmarked[:3]}
     if found:
         lossy_only = all(Path(p).suffix.lower() not in LOSSLESS_SUFFIXES for p in found)
         if lossy_only and format_rank(offer["best"]["type"]) >= 3:
@@ -832,7 +884,7 @@ def collect_release(store, adapter, source_id, library, dry_run=False, allow_gat
             action, reason, detail = "deferred", defer[track["name"]], {}
         plan.append((track, saved_key.removeprefix("mix:"), action))
         summary["tracks"].append({"track": track["name"], "action": action, "reason": reason,
-                                  "format": track["best"]["type"]})
+                                  "format": track["best"]["type"], "seconds": seconds(track.get("duration"))})
         if action in {"skip", "upgrade_candidate", "uncertain", "replace", "deferred"}:
             store.event(source_id, "select", {"skip": "skipped", "upgrade_candidate": "upgrade_candidate",
                                               "uncertain": "needs_review", "replace": "replace",

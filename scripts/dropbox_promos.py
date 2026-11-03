@@ -14,7 +14,7 @@ import requests
 
 from promo_automation import Store, SKILLS, dropbox_skill
 from promo_cloud import protect_json, read_protected_json
-from audio_length import HEAD_BYTES, length_from_header
+from audio_length import length_from_stream
 from promo_pipeline import AUDIO_SUFFIXES, LibraryIndex, collect_release, version_group, version_kind, write_stream
 from process_promos import load_label_codes, open_rar, parse_filename, read_existing_tags
 
@@ -329,23 +329,10 @@ class DropboxPromos:
                 seconds = audio.info.length if audio else None
             elif entry.get("size"):
                 _, response = self.client.sharing_get_shared_link_file(self.store.source_url(source_id), path=entry.get("path"))
-                head, wanted = b"", HEAD_BYTES
                 try:
-                    for chunk in response.iter_content(1 << 14):
-                        head += chunk
-                        if len(head) < wanted:
-                            continue
-                        seconds = length_from_header(head, entry["size"])
-                        if not isinstance(seconds, tuple):
-                            break
-                        wanted = seconds[1] + HEAD_BYTES  # an ID3 tag with cover art pushes the first frame back
-                        if wanted > 4 * 1024**2:
-                            break
+                    seconds = length_from_stream(response.iter_content(1 << 14), entry["size"])
                 finally:
                     response.close()
-                if not isinstance(seconds, float):
-                    seconds = length_from_header(head, entry["size"]) if len(head) < wanted else None
-                    seconds = seconds if isinstance(seconds, float) else None
         except Exception as error:
             self.store.event(source_id, "length_probe", "failed", file=entry.get("name"), error=str(error)[:200])
         self.lengths[key] = seconds

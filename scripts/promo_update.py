@@ -185,8 +185,9 @@ def plan_globally(run_dir, platforms=PLATFORMS):
     """When two sources offer the same mix this run, collect only the best copy: lossless first, then the
     platform order in promo_adapters. The others are deferred; reconcile ignores deferrals, so a failed winner
     is fetched from the next source in the same run."""
-    from promo_pipeline import format_rank, loose_key, mix_key
-    offers = {}
+    from promo_pipeline import (SAME_LENGTH_SECONDS, dj_version, format_rank, loose_key, mix_key, mix_parts,
+                                version_group, version_kind)
+    offers, versions = {}, {}
     for priority, platform in enumerate(platforms):
         report = load(run_dir / f"{platform}-plan.json")
         if not report or report.get("collection_disabled"):
@@ -198,11 +199,32 @@ def plan_globally(run_dir, platforms=PLATFORMS):
                 if track.get("action") not in {"download", "replace"}:
                     continue
                 key = loose_key(track["track"]) or mix_key(track["track"])
-                offers.setdefault(key, []).append({
-                    "platform": platform, "source_id": release["source_id"], "track": track["track"],
-                    "format": track.get("format") or "", "rank": format_rank(track.get("format") or ""),
-                    "priority": priority})
+                offer = {"platform": platform, "source_id": release["source_id"], "track": track["track"],
+                         "format": track.get("format") or "", "rank": format_rank(track.get("format") or ""),
+                         "priority": priority, "seconds": track.get("seconds")}
+                offers.setdefault(key, []).append(offer)
+                versions.setdefault(version_group(track["track"]), []).append(offer)
     defer, choices = {}, []
+    for group in versions.values():
+        # 2026-11-03: a radio edit from one promo and the extended mix from another arrive in the same run. Only the
+        # extended mix survives, as within one release. 'Radio edit' is a version marked radio or edit, or one with
+        # no mix name that is not clearly longer. A DJ edit and an explicit Original Mix keep their own decision.
+        extended = [o for o in group if version_kind(o["track"]) == "extended"]
+        if not extended:
+            continue
+        longest = max((o["seconds"] or 0) for o in extended)
+        for offer in group:
+            kind = version_kind(offer["track"])
+            if kind == "extended" or dj_version({"name": offer["track"], "duration": offer["seconds"]}):
+                continue
+            unmarked = kind == "full" and not mix_parts(offer["track"])[1]
+            if kind == "short" or unmarked and not (longest and offer["seconds"]
+                                                    and offer["seconds"] > longest + SAME_LENGTH_SECONDS):
+                best = max(extended, key=lambda o: (o["rank"], -o["priority"]))
+                defer.setdefault(offer["platform"], {}).setdefault(offer["source_id"], {})[offer["track"]] = \
+                    f"the extended mix is collected from {best['platform']} this run"
+                choices.append({"track": best["track"], "chosen": f"{best['platform']} ({best['format']})",
+                                "deferred": [f"{offer['platform']} ({offer['format']}): {offer['track']}"]})
     for group in offers.values():
         if len(group) < 2:
             continue
@@ -210,7 +232,7 @@ def plan_globally(run_dir, platforms=PLATFORMS):
         reason = f"the same mix is collected from {best['platform']} ({best['format']}) this run"
         for offer in group:
             if offer is not best:
-                defer.setdefault(offer["platform"], {}).setdefault(offer["source_id"], {})[offer["track"]] = reason
+                defer.setdefault(offer["platform"], {}).setdefault(offer["source_id"], {}).setdefault(offer["track"], reason)
         choices.append({"track": best["track"], "chosen": f"{best['platform']} ({best['format']})",
                         "deferred": [f"{o['platform']} ({o['format']})" for o in group if o is not best]})
     result = {"finished": now(), "defer": defer, "choices": choices}
@@ -323,6 +345,8 @@ def collect_pass(store, platform, run_dir, reconcile=False):
                   exceptions=sum(r["state"] == "exception" for r in report["releases"]))
     report["upgrade_candidates_ask_user"] = sorted({t["track"] for r in settled
         for t in r["result"].get("tracks", []) if t.get("action") == "upgrade_candidate"})
+    report["length_questions_ask_user"] = sorted({t["track"] for r in settled for t in r["result"].get("tracks", [])
+        if t.get("action") == "uncertain" and "lengths cannot be compared" in t.get("reason", "")})
     save(report_path, report)
     store.sync_logs()  # one lane of many; the summary phase flushes the full logs once
     return {k: report[k] for k in ("platform", "state", "actions", "exceptions")}
@@ -389,7 +413,8 @@ def housekeeping(store, run_dir, keep_runs=3, source_cache_days=60):
 
 def final_states(run_dir, platforms=PLATFORMS, store=None):
     """Latest state per release over discovery, collection and reconcile, so a recovered failure is not reported."""
-    states, notes = {}, {"catalogue_errors": [], "collection_disabled": [], "upgrades": set(), "reclassified": {}}
+    states, notes = {}, {"catalogue_errors": [], "collection_disabled": [], "upgrades": set(), "length_questions": set(),
+                     "reclassified": {}}
     evidence = {row["source_id"]: row for row in load(run_dir / "availability-live-evidence.json", {}).get("results", [])}
     for platform in platforms:
         for suffix in ("-plan", "", "-reconcile"):
@@ -401,6 +426,7 @@ def final_states(run_dir, platforms=PLATFORMS, store=None):
             if suffix == "-plan" and report.get("collection_disabled"):
                 notes["collection_disabled"].append(platform + ": " + report["collection_disabled"])
             notes["upgrades"].update(report.get("upgrade_candidates_ask_user", []))
+            notes["length_questions"].update(report.get("length_questions_ask_user", []))
             for release in report.get("releases", []):
                 sid = release.get("source_id") or release.get("release")
                 url = None
@@ -440,7 +466,8 @@ def summary(store, run_dir, platforms=PLATFORMS):
               "failure_unit": "promo entries, not individual tracks",
               "actionable_campaign_titles": sorted({name for (state, name) in states.values() if state == "exception"}),
               "catalogue_errors": notes["catalogue_errors"], "collection_disabled": notes["collection_disabled"],
-              "best_copy_choices": choices, "upgrade_candidates": upgrades, "questions": [
+              "best_copy_choices": choices, "upgrade_candidates": upgrades,
+              "length_questions": sorted(notes["length_questions"]), "questions": [
                   {"file": r["name"], "state": r["state"], "evidence": r.get("evidence", [])} for r in leftovers]}
     # A worker can fail before it reports any release. Do not let an empty plan
     # turn that platform-wide coverage gap into an apparently clean summary.
@@ -489,6 +516,9 @@ def summary(store, run_dir, platforms=PLATFORMS):
         lines.append(f"{len(ignored)} non-release/profile links were ignored, not counted as failed downloads: " + "; ".join(ignored) + ".")
     if upgrades:
         lines.append("Lossless upgrades offered for lossy library copies: " + "; ".join(upgrades) + ".")
+    if result["length_questions"]:
+        lines.append("Extended mixes not collected because an unmarked library copy's length could not be compared: "
+                     + "; ".join(result["length_questions"]) + ".")
     if leftovers:
         lines.append("Labels that promo pages, emails, Beatport and web research could not settle: "
                      + "; ".join(r["name"] for r in leftovers) + ".")

@@ -111,3 +111,21 @@ def length_from_header(head, total, offset=0):
     if head[:4] == b"fLaC":
         return _flac(head, total)
     return _mp3(head, total)
+
+
+def length_from_stream(chunks, total):
+    """Seconds from the start of a streamed file, reading only as far as the header needs; None if unreadable."""
+    head, wanted, seconds = b"", HEAD_BYTES, None
+    for chunk in chunks:
+        head += chunk
+        if len(head) < wanted:
+            continue
+        seconds = length_from_header(head, total)
+        if not isinstance(seconds, tuple):
+            break
+        wanted = seconds[1] + HEAD_BYTES  # an ID3 tag with cover art pushes the first frame back
+        if wanted > 4 * 1024**2:
+            break
+    if not isinstance(seconds, float):
+        seconds = length_from_header(head, total) if len(head) < wanted else None
+    return seconds if isinstance(seconds, float) else None
