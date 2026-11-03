@@ -18,6 +18,7 @@ import time
 
 from promo_adapters import PLATFORMS, adapter_for
 from promo_automation import DEST, Store, STATE, atomic_text, index_library, now, process_alive
+from promo_outcomes import reviewed_state
 
 LANES = 4
 # A session-wide login problem: stop asking that platform for the rest of the run, but report every release.
@@ -45,6 +46,8 @@ def classify(error):
     name = type(error).__name__
     if name in UNAVAILABLE_ERRORS:
         return "unavailable"
+    if name == "NotARelease":
+        return "ignored_link"
     if name in ACCESS_ERRORS:
         return "access_blocked"
     if name == "PortalBlocked":
@@ -129,6 +132,8 @@ def discover_pass(store, platform, run_dir, age_days, refresh_metadata=False):
     if getattr(adapter, "collection_enabled", True) is False:
         report["collection_disabled"] = getattr(adapter, "collection_disabled_reason",
                                                 "collection is switched off until its single pilot is verified")
+    if callable(getattr(adapter, "collection_limit", None)):
+        report["initial_asset_limit"] = adapter.collection_limit()
     save(report_path, report)
     library, blocker = LibraryIndex(store), None
     try:
@@ -159,7 +164,9 @@ def discover_pass(store, platform, run_dir, age_days, refresh_metadata=False):
                     adapter.prepare_source(sid)
                 entry.update(state="planned", plan=collect_release(store, planning_adapter, sid, library, dry_run=True))
             except Exception as error:
-                entry.update(state=classify(error), reason=safe_error(error))
+                entry.update(state=classify(error), reason=safe_error(error), error_type=type(error).__name__)
+                if entry["state"] in {"unavailable", "ignored_link"}:
+                    store.event(sid, "update", entry["state"], platform=platform, reason=entry["reason"])
                 if entry["state"] == "exception":
                     store.event(sid, "update", "release_failed", platform=platform, error=entry["reason"])
                 if type(error).__name__ in SESSION_ERRORS:
@@ -284,13 +291,20 @@ def collect_pass(store, platform, run_dir, reconcile=False):
                             adapter.snapshot(sid, refresh=True)
                         if hasattr(adapter, "prepare_source"):
                             adapter.prepare_source(sid)
-                    result = collect_release(store, adapter, sid, library, allow_gate=True, defer=defer.get(sid))
+                    limits = {}
+                    if callable(getattr(adapter, "collection_limit", None)):
+                        limit = adapter.collection_limit()
+                        if limit is not None:
+                            limits["max_assets"] = current["asset_limit"] = limit
+                    result = collect_release(store, adapter, sid, library, allow_gate=True, defer=defer.get(sid), **limits)
                     current["state"] = "finished"
                 if hasattr(adapter, "cleanup_source"):
                     adapter.cleanup_source(sid, result)
                 current["result"] = result
             except Exception as error:
-                current.update(state=classify(error), reason=safe_error(error))
+                current.update(state=classify(error), reason=safe_error(error), error_type=type(error).__name__)
+                if current["state"] in {"unavailable", "ignored_link"}:
+                    store.event(sid, "update", current["state"], platform=platform, reason=current["reason"])
                 if current["state"] == "exception":
                     store.event(sid, "update", "release_failed", platform=platform, error=current["reason"])
                 if type(error).__name__ in SESSION_ERRORS:
@@ -373,9 +387,10 @@ def housekeeping(store, run_dir, keep_runs=3, source_cache_days=60):
     return removed
 
 
-def final_states(run_dir, platforms=PLATFORMS):
+def final_states(run_dir, platforms=PLATFORMS, store=None):
     """Latest state per release over discovery, collection and reconcile, so a recovered failure is not reported."""
-    states, notes = {}, {"catalogue_errors": [], "collection_disabled": [], "upgrades": set()}
+    states, notes = {}, {"catalogue_errors": [], "collection_disabled": [], "upgrades": set(), "reclassified": {}}
+    evidence = {row["source_id"]: row for row in load(run_dir / "availability-live-evidence.json", {}).get("results", [])}
     for platform in platforms:
         for suffix in ("-plan", "", "-reconcile"):
             report = load(run_dir / (platform + suffix + ".json"))
@@ -387,7 +402,20 @@ def final_states(run_dir, platforms=PLATFORMS):
                 notes["collection_disabled"].append(platform + ": " + report["collection_disabled"])
             notes["upgrades"].update(report.get("upgrade_candidates_ask_user", []))
             for release in report.get("releases", []):
-                states[(platform, release.get("source_id") or release.get("release"))] =(release["state"], release.get("release") or "")
+                sid = release.get("source_id") or release.get("release")
+                url = None
+                if store and platform in {"soundcloud", "disco"} and release.get("state") == "exception":
+                    try:
+                        url = store.source_url(sid)
+                    except (ValueError, TypeError):
+                        pass
+                state = reviewed_state(platform, release, url, evidence.get(sid))
+                states[(platform, sid)] = (state, release.get("release") or "")
+                notes["reclassified"].pop((platform, sid), None)
+                if state != release["state"]:
+                    notes["reclassified"][(platform, sid)] = {
+                        "platform": platform, "source_id": sid, "release": release.get("release"),
+                        "original_state": release["state"], "state": state, "reason": release.get("reason")}
     return states, notes
 
 
@@ -396,9 +424,10 @@ def summary(store, run_dir, platforms=PLATFORMS):
     manifest = load(run_dir / "run.json")
     delivered = [json.loads(d).get("dropbox_path") for (d,) in store.db.execute(
         "SELECT details FROM events WHERE action='delivery' AND status='delivery_verified' AND utc>=?", (manifest["started"],))]
-    states, notes = final_states(run_dir, platforms)
+    states, notes = final_states(run_dir, platforms, store)
     pick = lambda wanted: sorted({f"{p}: {name}" for (p, _), (state, name) in states.items() if state == wanted})
     exceptions, unavailable = pick("exception"), pick("unavailable")
+    ignored = pick("ignored_link")
     blocked = Counter(p for (p, _), (state, _) in states.items() if state in {"access_blocked", "blocked", "consent_required"})
     audit = load(run_dir / "final-audit.json", {})
     leftovers = load(STATE / "research-leftovers.json", [])
@@ -407,6 +436,9 @@ def summary(store, run_dir, platforms=PLATFORMS):
     result = {"delivered": len({p for p in delivered if p}), "audit": audit.get("counts", {}),
               "ready_to_merge": audit.get("ready_to_merge", False), "exceptions": exceptions,
               "unavailable_releases": unavailable, "blocked_by_platform": dict(blocked),
+              "ignored_links": ignored, "outcome_reclassifications": list(notes["reclassified"].values()),
+              "failure_unit": "promo entries, not individual tracks",
+              "actionable_campaign_titles": sorted({name for (state, name) in states.values() if state == "exception"}),
               "catalogue_errors": notes["catalogue_errors"], "collection_disabled": notes["collection_disabled"],
               "best_copy_choices": choices, "upgrade_candidates": upgrades, "questions": [
                   {"file": r["name"], "state": r["state"], "evidence": r.get("evidence", [])} for r in leftovers]}
@@ -450,9 +482,11 @@ def summary(store, run_dir, platforms=PLATFORMS):
     if blocked:
         lines.append("Promos blocked by login, consent or a feedback gate: " + "; ".join(f"{p} {n}" for p, n in sorted(blocked.items())) + ".")
     if exceptions:
-        lines.append(f"{len(exceptions)} promos failed and are retried next run: " + "; ".join(exceptions) + ".")
+        lines.append(f"{len(exceptions)} promo entries need investigation (not a track count): " + "; ".join(exceptions) + ".")
     if unavailable:
         lines.append(f"{len(unavailable)} promos were explicitly unavailable on the platform: " + "; ".join(unavailable) + ".")
+    if ignored:
+        lines.append(f"{len(ignored)} non-release/profile links were ignored, not counted as failed downloads: " + "; ".join(ignored) + ".")
     if upgrades:
         lines.append("Lossless upgrades offered for lossy library copies: " + "; ".join(upgrades) + ".")
     if leftovers:

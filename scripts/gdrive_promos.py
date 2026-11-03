@@ -25,6 +25,7 @@ from promo_mail import discover, newest_offer_age
 from promo_pipeline import AUDIO_SUFFIXES, LibraryIndex, collect_release
 from process_promos import load_label_codes
 from soundcloud import mail_label
+from promo_outcomes import NotARelease, ReleaseUnavailable
 
 GWS_PYTHON = Path(sys.executable)  # the bridge is stdlib-only; Google's libraries are needed only for its one-time login
 GWS_BRIDGE = SKILLS / "google-workspace-files/scripts/gws_bridge.py"
@@ -67,8 +68,13 @@ class GoogleDrivePromos(DropboxPromos):
 
     def _get(self, file_id, fields):
         self.calls += 1
-        return gws("drive", "files", "get", "--params", json.dumps(
-            {"fileId": file_id, "fields": fields, "supportsAllDrives": True}))
+        try:
+            return gws("drive", "files", "get", "--params", json.dumps(
+                {"fileId": file_id, "fields": fields, "supportsAllDrives": True}))
+        except RuntimeError as error:
+            if "File not found:" in str(error):
+                raise ReleaseUnavailable("Google Drive item is missing or no longer shared with this account") from None
+            raise
 
     def _children(self, folder_id, prefix="", depth=0):
         if depth > 4:
@@ -112,7 +118,7 @@ class GoogleDrivePromos(DropboxPromos):
             return read_protected_json(cache)
         target = drive_target(self.store.source_url(source_id))
         if target is None:
-            raise RuntimeError("Google Drive link carries no file or folder id (cut off in the mail)")
+            raise NotARelease("Google Drive link carries no file or folder id (cut off in the mail)")
         kind, drive_id = target
         self.store.event(source_id, "view", "intent", platform=self.platform, platform_effect="Drive metadata only")
         self.store.sync_logs()

@@ -15,6 +15,7 @@ from html import unescape
 from urllib.parse import parse_qs, urlencode, urljoin, urlsplit
 
 from curl_cffi import requests
+from promo_outcomes import ReleaseUnavailable
 
 from promo_automation import Store, now
 from promo_cloud import FEEDBACK_CLOSERS, FEEDBACK_OPENERS, RATING_RANGE, protect_json, read_protected_json
@@ -143,7 +144,13 @@ class LabelEngine:
         response = self._get(API.format(**params), headers={"Origin": SITE.rstrip("/"), "Referer": SITE + "promo.php",
                                                             "Accept": "application/json, text/plain, */*"})
         if response.status_code == 400:
-            raise RuntimeError("Label Engine promo expired or removed (API HTTP 400)")
+            try:
+                missing = response.json() == []
+            except ValueError:
+                missing = False
+            if missing:
+                raise ReleaseUnavailable("Label Engine no longer offers this recipient release (empty API HTTP 400)")
+            raise RuntimeError("Label Engine metadata API HTTP 400; availability is not confirmed")
         if response.status_code != 200:
             raise RuntimeError(f"Label Engine API HTTP {response.status_code}")
         data = response.json()

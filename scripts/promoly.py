@@ -13,6 +13,7 @@ from datetime import datetime, timezone
 from urllib.parse import quote, urlsplit
 
 from curl_cffi import requests
+from promo_outcomes import ReleaseUnavailable
 
 from promo_automation import Store, now
 from promo_cloud import FEEDBACK_CLOSERS, FEEDBACK_OPENERS, protect_json, read_protected_json
@@ -27,16 +28,16 @@ TYPES = {"wav", "aif", "aiff", "flac", "mp3", "m4a"}
 def normalize_release(data):
     campaign = data["campaign"]
     if campaign.get("archived") or campaign.get("deleted_at") or campaign.get("visibility") == "private":
-        raise RuntimeError("Campaign is archived, deleted or private")
+        raise ReleaseUnavailable("Campaign is archived, deleted or private")
     if campaign.get("enableDownload") != "on":
-        raise RuntimeError("Uploader has disabled downloads")
+        raise ReleaseUnavailable("Uploader has disabled downloads")
     expires = campaign.get("expires")
     if expires:
         expiry = datetime.fromisoformat(expires.replace("Z", "+00:00"))
         if expiry.tzinfo is None:
             expiry = expiry.replace(tzinfo=timezone.utc)
         if expiry <= datetime.now(timezone.utc):
-            raise RuntimeError("Campaign has expired")
+            raise ReleaseUnavailable("Campaign has expired")
     tracks = []
     for track in campaign.get("tracks") or []:
         artist = (track.get("track_artist") or "").strip()
@@ -81,6 +82,9 @@ class Promoly:
         except Exception as error:
             raise RuntimeError("Promoly API request failed: " + type(error).__name__) from None
         try:
+            if (response.status_code in (404, 410) and method == "GET" and path.startswith("/api/landers/")
+                    and "/" not in path[len("/api/landers/"):]):
+                raise ReleaseUnavailable("Promoly no longer offers this recipient campaign")
             if response.status_code != 200:
                 raise RuntimeError(f"Promoly API answered HTTP {response.status_code}")
             return response.json()

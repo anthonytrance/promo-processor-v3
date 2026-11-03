@@ -195,9 +195,16 @@ def parse_release(data):
 
 
 class Fatdrop:
-    # The coordinator plans FATdrop but collects nothing until one bounded original pilot is verified.
-    collection_enabled = False
-    collection_disabled_reason = "FATdrop collection stays off until its single original pilot is verified"
+    collection_enabled = True
+
+    def original_verified(self):
+        return self.store.db.execute("SELECT 1 FROM assets a JOIN sources s ON s.id=a.source_id "
+                                     "WHERE s.platform='fatdrop' AND a.stage='delivery_verified' LIMIT 1").fetchone() is not None
+
+    def collection_limit(self):
+        # The first eligible original is its own bounded live verification. The shared pipeline verifies audio,
+        # precision, tags and Dropbox bytes before delivery_verified can lift this limit for later work.
+        return None if self.original_verified() else 1
 
     def __init__(self, store, session=None):
         self.store, self.calls = store, 0
@@ -415,11 +422,11 @@ class Fatdrop:
                         result["state"] = "same_campaign_already_reported"
                     else:
                         seen_campaigns.add(release["remote_id"])
-                        if not dry_run:
-                            raise ContractReview("FATdrop collection remains disabled until its single original pilot is verified")
-                        planned = collect_release(self.store, self, row["id"], library, dry_run=True)
-                        result.update(state="dry_run", tracks=planned["tracks"], review_tracks=release["review_tracks"],
-                                      availability="metadata inspected; transfer unverified")
+                        planned = collect_release(self.store, self, row["id"], library, dry_run=dry_run,
+                                                  max_assets=None if dry_run else self.collection_limit())
+                        result.update(state="dry_run" if dry_run else "finished", tracks=planned["tracks"],
+                                      review_tracks=release["review_tracks"],
+                                      availability="original verified" if self.original_verified() else "metadata inspected; transfer unverified")
                 except LoginRequired as error:
                     login_blocker = str(error)
                     result.update(state="login_required", error=login_blocker)
@@ -433,7 +440,7 @@ class Fatdrop:
         self.store.sync_logs(force=True)
         return {"platform": "fatdrop", "dry_run": dry_run, "calls": self.calls, "releases": reports,
                 "catalogue_complete": catalogue.get("complete") is True, "catalogue_error": catalogue.get("error"),
-                "live_original_verified": False}
+                "live_original_verified": self.original_verified()}
 
 
 def main():
@@ -466,11 +473,11 @@ def main():
                     raise ValueError("FATdrop reports must stay in the protected runtime state tree")
                 atomic_text(target, json.dumps(result, ensure_ascii=False, indent=2))
         else:
-            if not args.dry_run and args.max_assets is None:
-                raise ContractReview("FATdrop live collection is limited to bounded pilots; pass --max-assets")
+            cap = None if args.dry_run else adapter.collection_limit()
+            limit = args.max_assets if cap is None else min(cap, args.max_assets) if args.max_assets is not None else cap
             # Feedback stays closed: only releases the recipient has already reviewed (or ungated ones) can transfer.
             result = collect_release(store, adapter, args.source_id, LibraryIndex(store), dry_run=args.dry_run,
-                                     max_assets=args.max_assets)
+                                     max_assets=limit)
             store.sync_logs(force=True)
         print(json.dumps(result, ensure_ascii=False, indent=2))
     except (LoginRequired, ContractReview, Unavailable) as error:

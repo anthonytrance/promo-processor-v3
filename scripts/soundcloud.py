@@ -23,6 +23,7 @@ from promo_cloud import protect_json, read_protected_json
 from promo_mail import discover, newest_offer_age
 from promo_pipeline import LibraryIndex, collect_release, write_stream
 from soundcloud_session import SESSION_FILE, SoundCloudSession, TokenExpired
+from promo_outcomes import NotARelease, ReleaseUnavailable, soundcloud_profile
 
 API = "https://api-v2.soundcloud.com"
 _PROMO_PREFIX = re.compile(r"^\s*(?:\[\s*promo\s*\]|promo\s*(?://|:|-|\|))\s*", re.I)
@@ -116,6 +117,8 @@ def mail_label(subject, sender=None):
 
 def normalize_release(item, extra_tracks=(), subject=None, sender=None):
     """Tracks with cleaned names, label evidence and the download offer from a resolved track or playlist."""
+    if item.get("kind") == "user":
+        raise NotARelease("SoundCloud link is a user, not a track or playlist")
     if item.get("kind") not in {"track", "playlist"}:
         raise RuntimeError("SoundCloud link is a " + str(item.get("kind")) + ", not a track or playlist")
     full = {t["id"]: t for t in extra_tracks}
@@ -208,7 +211,9 @@ class SoundCloud:
 
     def resolve(self, url):
         """Resolve a mailed link to track or playlist JSON; short links redirect to the item page."""
-        last = None
+        if soundcloud_profile(url):
+            raise NotARelease("SoundCloud profile/footer link, not a track or playlist offer")
+        last, statuses = None, []
         for variant in link_variants(url):
             target = variant
             if (urlsplit(variant).hostname or "").lower() == "on.soundcloud.com":
@@ -223,7 +228,10 @@ class SoundCloud:
             response = self._api("/resolve", url=target)
             if response.status_code == 200:
                 return response.json()
+            statuses.append(response.status_code)
             last = f"resolve HTTP {response.status_code}"
+        if statuses and all(code in (404, 410) for code in statuses) and urlsplit(clean_link(url)).hostname != "on.soundcloud.com":
+            raise ReleaseUnavailable("SoundCloud no longer offers this track/playlist to the recipient")
         raise RuntimeError("SoundCloud link did not resolve (" + str(last) + "); removed, private or mangled in the mail")
 
     def snapshot(self, source_id, refresh=False):

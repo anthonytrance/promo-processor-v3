@@ -142,7 +142,14 @@ class DropboxPromos:
             return read_protected_json(cache)
         self.store.event(source_id, "view", "intent", platform_effect="shared-link metadata and folder listings only")
         self.store.sync_logs()
-        inventory = shared_inventory(self.client, self.store.source_url(source_id))
+        from promo_outcomes import dropbox_metadata_error
+        try:
+            inventory = shared_inventory(self.client, self.store.source_url(source_id))
+        except Exception as error:
+            outcome = dropbox_metadata_error(error)
+            if outcome is error:
+                raise
+            raise outcome from None
         protect_json(cache, inventory)
         self.store.event(source_id, "view", "inspected", files=len(inventory["files"]), requests=inventory["requests"],
                          note="Shared link inventoried; no audio downloaded")
@@ -189,6 +196,10 @@ class DropboxPromos:
                 continue
             tracks.append({"name": name, "duration": None, "probe": file,
                            "artist": artist, "title": title, "label": label, "files": offer})
+        # An empty share may be removed music, so only a share holding other files counts as no release.
+        if files and not tracks and not any(Path(f["name"]).suffix.lower() in {".zip", ".rar"} for f in files):
+            from promo_outcomes import NotARelease
+            raise NotARelease("Shared link holds no audio (artwork, press kit or documents only)")
         # Lengths pick the main version of a mix offered more than once; marked extended mixes need none.
         groups = {}
         for track in tracks:

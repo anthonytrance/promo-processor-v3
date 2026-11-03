@@ -15,6 +15,7 @@ from promo_automation import Store
 from promo_cloud import protect_json, read_protected_json
 from promo_mail import discover, newest_offer_age
 from promo_pipeline import LibraryIndex, collect_release, write_stream
+from promo_outcomes import NotARelease
 
 AUDIO = {"wav": "wav", "aif": "aiff", "aiff": "aiff", "flac": "flac", "mp3": "mp3", "m4a": "m4a"}
 SHARE_PATHS = ("/share-new/", "/p/", "/share/")
@@ -90,6 +91,19 @@ class Disco:
             return response
         raise RuntimeError("Disco link has too many redirects")
 
+    def _expand_short(self, url):
+        """s.disco.ac short links only redirect; read where they point before judging the link."""
+        for _ in range(6):
+            self.calls += 1
+            response = self.session.get(url, allow_redirects=False, timeout=60)
+            response.close()
+            if response.status_code not in {301, 302, 303, 307, 308}:
+                raise RuntimeError(f"Disco short link HTTP {response.status_code}")
+            url = urljoin(url, response.headers.get("Location", ""))
+            if (urlsplit(url).hostname or "").lower() != "s.disco.ac":
+                return url
+        raise RuntimeError("Disco link has too many redirects")
+
     def snapshot(self, source_id, refresh=False):
         row = self.store.db.execute("SELECT 1 FROM sources WHERE id=? AND platform='disco'", (source_id,)).fetchone()
         if row is None:
@@ -98,8 +112,10 @@ class Disco:
         if cache.exists() and not refresh:
             return read_protected_json(cache)
         url = self.store.source_url(source_id)
+        if disco_host(url) and (urlsplit(url).hostname or "").lower() == "s.disco.ac":
+            url = self._expand_short(url)
         if not disco_host(url) or not urlsplit(url).path.startswith(SHARE_PATHS):
-            raise RuntimeError("Not a Disco recipient share link (campaign e-mail copies carry no tracks)")
+            raise NotARelease("Not a Disco recipient share link (campaign e-mail copies and footers carry no tracks)")
         self.store.event(source_id, "view", "intent", platform="disco", platform_effect="opening the share page may show a view")
         response = self._get(url)
         if response.status_code != 200:

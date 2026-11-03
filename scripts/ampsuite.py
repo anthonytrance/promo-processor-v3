@@ -10,6 +10,7 @@ from urllib.parse import urljoin, urlsplit
 
 from bs4 import BeautifulSoup
 from curl_cffi import requests
+from promo_outcomes import ReleaseUnavailable
 
 from promo_automation import Store
 from promo_cloud import protect_json, read_protected_json
@@ -19,6 +20,8 @@ from promo_pipeline import LibraryIndex, collect_release, write_stream
 
 def parse_release(html, source_url):
     soup = BeautifulSoup(html, "html.parser")
+    if "this promotion has expired" in soup.get_text(" ", strip=True).lower():
+        raise ReleaseUnavailable("Ampsuite explicitly says this promotion has expired")
     date = soup.select_one("#release_date")
     label_match = re.search(r"\s+on\s+(.+)$", date.get_text(" ", strip=True)) if date else None
     label = label_match[1].strip() if label_match else None
