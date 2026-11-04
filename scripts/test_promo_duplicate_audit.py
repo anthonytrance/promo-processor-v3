@@ -48,6 +48,37 @@ def test_same_mix_aliases_in_delivery_are_compared_but_different_audio_is_kept(t
         store.db.close()
 
 
+@pytest.mark.parametrize("copies_configured", [True, False])
+def test_copy_in_personal_folder_never_removes_the_delivered_track(tmp_path, monkeypatch, copies_configured):
+    name = "Artist - Song (Extended Mix) [Label].aiff"
+    folder = "/Music/Copied This Week"
+    if copies_configured:
+        monkeypatch.setitem(pipeline.SETTINGS, "personal_copy_folders", [folder])
+    store = Store(tmp_path)
+    try:
+        store.sync_logs = mock.Mock()
+        path = audit.DEST + "/" + name
+        remote = SimpleNamespace(id="id:1", rev="rev1", name=name, path_lower=path.lower(), path_display=path,
+                                 content_hash="same")
+        store.db.executemany("INSERT INTO library(path,remote_id,revision,content_hash) VALUES(?,?,?,?)",
+                             [(path.lower(), remote.id, remote.rev, "same"),
+                              ((folder + "/" + name).lower(), "id:2", "rev2", "same")])
+        store.db.commit()
+        client = mock.Mock(files_get_metadata=lambda key: remote)
+        monkeypatch.setattr(audit, "index_library", lambda store: None)
+        monkeypatch.setattr(audit, "dropbox_skill", lambda: (None, client))
+        monkeypatch.setattr(audit, "readback", lambda store, client, remote, folder: Path("1.aiff"))
+        monkeypatch.setattr(audit, "validate_audio", lambda path: {"duration": 360})
+        monkeypatch.setattr(audit, "filename_and_tag_issues", lambda name, local: ([], {}, name))
+        monkeypatch.setattr(audit, "pcm_identity", lambda path: {"sha256": "x"})
+        result = audit.audit(store, tmp_path)
+        assert client.files_delete_v2.called is not copies_configured
+        if copies_configured:
+            assert result["counts"] == {"verified": 1}
+    finally:
+        store.db.close()
+
+
 def test_pcm_identity_does_not_round_distinct_float_audio_to_integer(tmp_path):
     identities = []
     for i, value in enumerate([0.25, 0.25 + 2**-40]):

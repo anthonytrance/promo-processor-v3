@@ -120,3 +120,11 @@ def test_research_holds_and_sample_folder_do_not_count_as_owned(tmp_path, monkey
         assert index.matches(pipeline.mix_key(Path(paths[3]).name))
     finally:
         store.db.close()
+
+
+def test_personal_copy_folder_is_recognised_but_stays_owned(monkeypatch):
+    monkeypatch.setattr(pipeline, "SETTINGS", {"personal_copy_folders": ["/Music/Promos/Copied This Week"]})
+    assert pipeline.personal_copy("/music/promos/copied this week/a - song [l].mp3")
+    assert pipeline.ownership_path("/music/promos/copied this week/a - song [l].mp3")
+    assert not pipeline.personal_copy("/music/promos/copied this week extra/a - song [l].mp3")
+    assert not pipeline.personal_copy("/music/library/a - song [l].mp3")

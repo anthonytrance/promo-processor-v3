@@ -406,12 +406,20 @@ def library_name(path):
     return re.sub(r"\s+-\d+(?:[.,]\d+)?$", "", match.group(1)) + Path(name).suffix
 
 
+def in_folder(path, folders):
+    target = unicodedata.normalize("NFC", path).casefold()
+    return any(target.startswith(unicodedata.normalize("NFC", folder).casefold().rstrip("/") + "/")
+               for folder in folders if folder)
+
+
 def ownership_path(path):
     """Research holds and rejection samples are not evidence that the user owns a playable mix."""
-    ignored = [HOLD, SETTINGS.get("exclusion_samples_folder")]
-    target = unicodedata.normalize("NFC", path).casefold()
-    return not any(target.startswith(unicodedata.normalize("NFC", folder).casefold().rstrip("/") + "/")
-                   for folder in ignored if folder)
+    return not in_folder(path, [HOLD, SETTINGS.get("exclusion_samples_folder")])
+
+
+def personal_copy(path):
+    """The user's own copies of delivered tracks: a track there still counts as owned, but never justifies a removal."""
+    return in_folder(path, SETTINGS.get("personal_copy_folders", []))
 
 
 class LibraryIndex:

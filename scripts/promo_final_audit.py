@@ -11,7 +11,7 @@ import unicodedata
 from mutagen import File as MutagenFile
 
 from promo_automation import DEST, HOLD, atomic_text, dropbox_hash, dropbox_skill, index_library, now
-from promo_pipeline import (AUDIO_SUFFIXES, LOSSY_SUFFIXES, loose_key, mix_key, ownership_path, probe,
+from promo_pipeline import (AUDIO_SUFFIXES, LOSSY_SUFFIXES, loose_key, mix_key, ownership_path, personal_copy, probe,
                             tag_mismatches, validate_audio)
 from process_promos import (apply_typo_corrections, build_target_filename, clean_master_suffixes,
                            normalize_ft_to_feat, normalize_mix_type, parse_filename,
@@ -156,7 +156,9 @@ def audit(store, run_dir):
             if Path(r["path"]).suffix.lower() in AUDIO_SUFFIXES]
     # Needs Research holds files that are known not to be final; they are neither audited nor duplicates of anything.
     tests = [r for r in rows if r["path"].startswith(DEST.lower() + "/") and not r["path"].startswith(HOLD.lower() + "/")]
-    others = [r for r in rows if not r["path"].startswith(DEST.lower() + "/") and ownership_path(r["path"])]
+    # 2026-11-04: this audit deleted 35 delivered tracks for matching copies the user had made.
+    others = [r for r in rows if not r["path"].startswith(DEST.lower() + "/") and ownership_path(r["path"])
+              and not personal_copy(r["path"])]
     by_key, by_candidate, by_hash = defaultdict(list), defaultdict(list), defaultdict(list)
     for row in others:
         by_key[mix_key(Path(row["path"]).name)].append(row)

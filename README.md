@@ -30,6 +30,8 @@ The installer names any other program it needs (ffmpeg, 7-Zip, browser-use) toge
 
 The settings file is JSON. Its keys are listed in the Setup section of `SKILL.md`: the mailbox, the destination folder, the library root used for the duplicate check, the state folder for the local database, logs and saved logins, and optional credential file paths. Set the `PROMO_SETTINGS` environment variable to use a settings file somewhere else.
 
+An optional `personal_copy_folders` lists Dropbox folders holding the user's own copies of delivered tracks. The final audit ignores them, so a copy there can never delete a delivered track. The duplicate check before download still sees them.
+
 An optional `exclusion_samples_folder` names a Dropbox folder for examples of unwanted labels. Each update imports their complete `[Label]` names into `audit/exclusions.csv` before collecting. Sister imprints stay separate, and Self Released samples require review. Run `python scripts/promo_exclusions.py` to preview, or add `--apply --sweep` to update the list and clear excluded files from the delivery folder. Sample files are kept and do not count as owned library tracks.
 
 ## Using it
