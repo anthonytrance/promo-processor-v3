@@ -161,11 +161,27 @@ def clean_link(url):
     return url
 
 
-def discover(store, since="30d", platforms=None, folders=("INBOX",), sender_domain=None):
+JUNK_NAMES = ("Junk", "Spam", "Junk E-mail", "Junk Email", "Bulk Mail")
+
+
+def junk_folder(skill, client):
+    """The account's junk folder, by its RFC 6154 \\Junk flag first, else by a usual name; None when it has none.
+
+    2026-11-13: real promos (Aerodynamica, Promo Push, Promoly) were filtered to Spam and never collected.
+    """
+    finder = getattr(skill, "find_imap_folder", None)
+    return finder(client, list(JUNK_NAMES), special_use="\\Junk") if finder else None
+
+
+def discover(store, since="30d", platforms=None, folders=("INBOX",), sender_domain=None, include_junk=True):
     skill = email_skill()
     client = skill.imap_login(ACCOUNT)
     counts, examined, unadapted, unselected, unknown = Counter(), 0, {}, Counter(), []
     try:
+        folders = list(folders)
+        junk = junk_folder(skill, client) if include_junk else None
+        if junk and junk not in folders:
+            folders.append(junk)
         for folder in folders:
             skill._select(client, folder, readonly=True)
             validity = client.response("UIDVALIDITY")[1]
@@ -231,7 +247,8 @@ def discover(store, since="30d", platforms=None, folders=("INBOX",), sender_doma
                     subject = skill.decode_str(message.get("Subject", ""))
                     sender = skill.decode_str(message.get("From", ""))
                     links = links_from_message(message)
-                    report = unrecognised(links, subject, sender)
+                    # Junk is mostly real spam: only links to a known platform count there, unknown hosts are not reported.
+                    report = None if folder == junk else unrecognised(links, subject, sender)
                     if report:
                         report.update(folder=folder, uidvalidity=validity, uid=uid[1].decode(),
                                       message_id=message.get("Message-ID", ""))
@@ -303,10 +320,12 @@ def main():
     parser.add_argument("--platform", action="append", choices=sorted(DOMAINS))
     parser.add_argument("--folder", action="append")
     parser.add_argument("--sender-domain", help="Optional server-side mail filter to avoid rereading unrelated mail")
+    parser.add_argument("--no-junk", action="store_true", help="Do not also read the junk/spam folder")
     args = parser.parse_args()
     store = Store()
     try:
-        print(json.dumps(discover(store, args.since, args.platform, args.folder or ("INBOX",), args.sender_domain), ensure_ascii=False))
+        print(json.dumps(discover(store, args.since, args.platform, args.folder or ("INBOX",), args.sender_domain,
+                                  include_junk=not args.no_junk), ensure_ascii=False))
     finally:
         store.db.close()
 

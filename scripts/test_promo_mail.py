@@ -63,6 +63,44 @@ class UnknownSourceTests(unittest.TestCase):
         self.assertTrue(all(call.args[-1] == "(UID BODY.PEEK[])" for call in client.uid.call_args_list if call.args[0] == "fetch"))
         self.assertTrue(all(call.kwargs["readonly"] for call in skill._select.call_args_list))
 
+    def test_junk_folder_is_read_by_flag_and_its_spam_is_not_reported(self):
+        promo, spam = EmailMessage(), EmailMessage()
+        promo["Subject"], promo["From"], promo["Message-ID"] = "promo: Artist - Track [Label]", "x@label.invalid", "<p>"
+        promo.set_content("https://hearthis.ai/downloads/a?token=fake")
+        spam["Subject"], spam["From"], spam["Message-ID"] = "Exclusive release offer", "x@spam.invalid", "<s>"
+        spam.set_content("https://phish.invalid/sign?doc=1")
+        selected = []
+        client = mock.Mock()
+        client.response.return_value = ("OK", [b"1"])
+        def uid(command, *args):
+            folder = selected[-1]
+            if command == "search":
+                return ("OK", [b"7"])
+            body = promo if folder == "Spam" else spam
+            return ("OK", [(b"1 (UID 7)", body.as_bytes())])
+        client.uid.side_effect = uid
+        finder = mock.Mock(return_value="Spam")
+        skill = SimpleNamespace(imap_login=mock.Mock(return_value=client),
+                                _select=mock.Mock(side_effect=lambda c, f, readonly: selected.append(f)),
+                                find_imap_folder=finder, parse_date_arg=lambda x: "01-Oct-2026", decode_str=lambda x: x)
+        with tempfile.TemporaryDirectory() as root:
+            store = Store(root)
+            try:
+                with mock.patch.object(mail, "email_skill", return_value=skill):
+                    report = mail.discover(store, platforms=["hearthis"], folders=("INBOX",))
+                    rows = [tuple(r) for r in store.db.execute("SELECT folder FROM messages")]
+                    selected.clear()
+                    mail.discover(store, platforms=["hearthis"], folders=("INBOX",), include_junk=False)
+            finally:
+                store.db.close()
+        self.assertEqual(finder.call_args.kwargs["special_use"], "\\Junk")
+        self.assertEqual(report["link_occurrences"], {"hearthis": 1})
+        self.assertEqual(rows, [("Spam",)])
+        self.assertEqual(len(report["unrecognised_promo_mails"]), 1, "the inbox mail is still reported")
+        self.assertEqual(report["unrecognised_promo_mails"][0]["folder"], "INBOX")
+        self.assertTrue(all(call.kwargs["readonly"] for call in skill._select.call_args_list))
+        self.assertEqual(selected, ["INBOX"])
+
     def test_scanned_mail_is_not_downloaded_again_until_a_needed_source_is_missing(self):
         message = EmailMessage()
         message["Subject"], message["From"], message["Message-ID"] = "New promo", "x@label.invalid", "<synthetic>"
