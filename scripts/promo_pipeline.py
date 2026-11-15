@@ -55,6 +55,18 @@ def strip_track_number(name):
     return rest if rest != name and " - " in rest else name
 
 
+# 2026-11-12: 'DOWNLOAD ENABLED', '(Free Download)', '[DL Enabled]', '| download available' ending an upload title.
+_DOWNLOAD_NOTE = re.compile(r"[\s|/\-]*[(\[]?\s*(?:(?:free\s+)?(?:download|dl)\s+(?:enabled|available|now)"
+                            r"|free\s+(?:download|dl))\s*!*\s*[)\]]?\s*$", re.IGNORECASE)
+
+
+def strip_download_note(title):
+    """A title without the download notes at its end; a title that is only such a note stays as it is."""
+    while (note := _DOWNLOAD_NOTE.search(title or "")) and note.start() > 0:
+        title = title[:note.start()].rstrip()
+    return title
+
+
 def _script_trim(text):
     """'Yukes玉刻' is credited as 'Yukes' elsewhere: a name that mixes Latin and another script keeps the Latin part."""
     letters = [c for c in text if c.isalpha()]
@@ -309,10 +321,22 @@ class VersionIndex:
                     found.setdefault(path, kind)
         return list(found.items())
 
+    def artist_typos(self, *names):
+        """(path, kind) of the same work credited to the same artists but one with a one-letter typo ('henx' for
+        'henz'). Never ownership by itself: decide() only counts one when the lengths agree."""
+        found = {}
+        for name in names:
+            identity = track_identity(name or "")
+            for artists, path, kind in self.by_work.get(identity[1], ()) if identity else ():
+                mine, theirs = identity[0] - artists, artists - identity[0]
+                if len(mine) == len(theirs) == 1 and one_letter_apart(next(iter(mine)), next(iter(theirs)), 4):
+                    found[path] = kind
+        return list(found.items())
 
-def one_letter_apart(a, b):
-    """Two credits of 8 or more characters that differ in exactly one letter at the same place."""
-    return len(a) == len(b) >= 8 and sum(x != y for x, y in zip(a, b)) == 1 and \
+
+def one_letter_apart(a, b, shortest=8):
+    """Two credits of 8 (or shortest) or more characters that differ in exactly one letter at the same place."""
+    return len(a) == len(b) >= shortest and sum(x != y for x, y in zip(a, b)) == 1 and \
         all(x.isalpha() and y.isalpha() for x, y in zip(a, b) if x != y)
 
 
@@ -614,7 +638,36 @@ def delivered_this_pass(store, path):
 
 
 SAME_LENGTH_SECONDS = 10.0
+# 2026-11-12: two files of one recording differ by codec padding only; an artist-typo copy must match this closely.
+SAME_RECORDING_SECONDS = 1.0
 _DROPBOX = []
+
+
+def shorter_version(kind, other_kind, length=None, other_length=None):
+    """Is a `kind` copy a shorter version of the same mix than an `other_kind` copy? One rule for the global
+    planner, decide() and the final audit (2026-11-12).
+
+    A radio edit or edit beside an extended or full mix is shorter. An Original or unmarked version beside an
+    extended mix is shorter too, unless both lengths are known and it is clearly longer: then it is the extended
+    mix under a store-less name. A DJ edit is never shorter; it is kept beside the extended mix.
+    """
+    if kind in {"extended", "dj"}:
+        return False
+    if other_kind == "full":
+        return kind == "short"
+    if other_kind != "extended":
+        return False
+    length, other_length = seconds(length), seconds(other_length)
+    return not (kind == "full" and length and other_length and length > other_length + SAME_LENGTH_SECONDS)
+
+
+def known_seconds(store, path):
+    """Length of a library file from the delivery record when this pipeline delivered it, else from Dropbox."""
+    for (metadata,) in store.db.execute("SELECT metadata FROM assets WHERE lower(dropbox_path)=lower(?)", (path,)):
+        length = seconds(json.loads(metadata or "{}").get("raw_audio", {}).get("duration"))
+        if length:
+            return length
+    return owned_seconds(store, path)
 
 
 def owned_seconds(store, path):
@@ -709,9 +762,19 @@ def decide(store, library, key, offer, asset_key=None):
         # unmarked version beside an owned extended mix is a duplicate; an extended mix beside an owned Original is
         # reported for the user to judge, never delivered over it, unless that Original came in this same pass.
         kind = version_kind(offer.get("name") or min(names))
-        owned = getattr(library, "versions", None)
-        owned = owned.versions(*names) if isinstance(owned, VersionIndex) else []
-        longer = [p for p, k in owned if (k == "extended" and kind != "extended") or (k == "full" and kind == "short")]
+        index = getattr(library, "versions", None)
+        owned = index.versions(*names) if isinstance(index, VersionIndex) else []
+        offered = seconds(offer.get("duration"))
+        # 2026-11-12: 'henz x DENIAL - Hostile (Extended Mix)' was fetched again because the library copy is credited
+        # to 'henx'. A copy of the same kind whose artist differs by one letter is the same recording only when its
+        # length matches; otherwise it stays a different track.
+        typos = [(p, k) for p, k in index.artist_typos(*names) if k == kind and p not in dict(owned)] \
+            if isinstance(index, VersionIndex) and offered else []
+        typo_same = [p for p, k in typos if abs((known_seconds(store, p) or 0) - offered) <= SAME_RECORDING_SECONDS]
+        if typo_same:
+            return "skip", "the same recording is already in library under a one-letter artist spelling", \
+                {"library": typo_same[:3], "offered_seconds": offered}
+        longer = [p for p, k in owned if shorter_version(kind, k)]
         same = [p for p, k in owned if k == kind or (k == "dj" and kind == "short")]
         if longer:
             return "skip", "a longer version of this track is already in library", {"library": longer[:3]}
@@ -723,7 +786,6 @@ def decide(store, library, key, offer, asset_key=None):
             # of an earlier run and the extended mix still comes in. An unknown length is left for the user.
             unmarked = [p for p, k in owned if k == "full" and unmarked_name(p)]
             if unmarked:
-                offered = seconds(offer.get("duration"))
                 lengths = {p: owned_seconds(store, p) for p in unmarked}
                 if not offered or not all(lengths.values()):
                     return "uncertain", "an unmarked version is in library and the lengths cannot be compared; needs review", \

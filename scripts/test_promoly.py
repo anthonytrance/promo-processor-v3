@@ -6,7 +6,7 @@ from unittest import mock
 
 from promo_automation import Store
 from promo_mail import links_from_message, route
-from promoly import Promoly, normalize_release
+from promoly import Promoly, campaign_artist, normalize_release
 
 
 def fixture():
@@ -51,6 +51,19 @@ class PromolyTests(unittest.TestCase):
         data = fixture()
         data["feedback"] = [{"comment": "Existing feedback"}]
         self.assertFalse(normalize_release(data)["gated"])
+
+    def test_missing_track_artist_and_track_number(self):
+        # 2026-11-12: a campaign without track artists sent '01. Song'; synthetic names, same layout.
+        data = fixture()
+        data["campaign"].update(name="Some Artist - SOME LABEL", emailSubject="Some Artist - Song")
+        data["campaign"]["tracks"][0].update(track_artist=None, track_title="01. Song")
+        self.assertEqual(normalize_release(data)["tracks"][0]["name"], "Some Artist - Song")
+        data["campaign"]["tracks"][0]["track_title"] = "02. Song"
+        self.assertEqual(normalize_release(data)["tracks"][0]["name"], "Some Artist - 02. Song",
+                         "a number that is not this track's own stays")
+        for subject in ("Other Artist - Song", "VA - Song", None):
+            self.assertIsNone(campaign_artist({"name": "Some Artist - X", "emailSubject": subject}))
+        self.assertIsNone(campaign_artist({"name": "VA - X", "emailSubject": "VA - Y"}))
 
     def test_unsupported_legacy_payload_is_explicit(self):
         data = fixture()

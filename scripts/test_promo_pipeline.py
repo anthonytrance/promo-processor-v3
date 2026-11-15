@@ -736,6 +736,33 @@ class OwnedVersionTests(unittest.TestCase):
         self.assertEqual(self.decide("Eddo Brandwijk & Ferry Corsten - Oh How I Miss You (Extended Mix)", owned), "skip")
         self.assertEqual(self.decide("Akona - Bleed The 303 (Instrumental Extended Mix)", owned), "download")
 
+    def test_one_letter_artist_typo_is_owned_only_at_the_same_length(self):
+        # 2026-11-12: the library credits 'henx', the promo 'henz'; an unmarked radio edit sits beside it.
+        owned = ["/music library/10/henz x denial - hostile [ex communicado].aiff",
+                 "/music library/10/henx x denial - hostile (extended mix) [ex communicado].aiff"]
+        lengths = {owned[0]: 219.52, owned[1]: 338.593447}
+        with mock.patch.object(pipeline, "known_seconds", lambda store, path: lengths.get(path)), \
+                mock.patch.object(pipeline, "owned_seconds", lambda store, path: lengths.get(path)):
+            self.assertEqual(self.decide("henz x DENIAL - Hostile (Extended Mix)", owned, seconds=338.593469), "skip")
+            self.assertEqual(self.decide("henz x DENIAL - Hostile (Extended Mix)", owned, seconds=360), "download",
+                             "a different length under a near spelling is another track")
+        self.assertFalse(pipeline.one_letter_apart("henz", "hent", 8))
+
+    def test_download_note_title_beside_owned_extended_is_owned(self):
+        from soundcloud import split_title
+        artist, title, label = split_title("Eximinds & Bersu Bayraktar - My Mind [INTERPLAY RECORDS] Download Enabled")
+        self.assertEqual((artist, title, label), ("Eximinds & Bersu Bayraktar", "My Mind", "INTERPLAY RECORDS"))
+        owned = ["/music library/10/eximinds & bersu bayraktar - my mind (extended mix) [interplay records].aiff"]
+        self.assertEqual(self.decide(f"{artist} - {title}", owned, seconds=219.4), "skip")
+
+    def test_shorter_version_is_one_rule(self):
+        self.assertTrue(pipeline.shorter_version("full", "extended", 232, 393))
+        self.assertTrue(pipeline.shorter_version("full", "extended"))
+        self.assertFalse(pipeline.shorter_version("full", "extended", 420, 330))
+        self.assertTrue(pipeline.shorter_version("short", "full"))
+        self.assertFalse(pipeline.shorter_version("full", "full", 200, 400))
+        self.assertFalse(pipeline.shorter_version("dj", "extended", 200, 400))
+
     def test_lossless_offer_of_lossy_spelling_variant_stays_an_upgrade_question(self):
         owned = ["/music library/09/akona, nick slater - bleed the 303 (extended mix) [x].mp3"]
         self.assertEqual(self.decide("Akona - Bleed The 303 (Extended Mix)", owned), "upgrade_candidate")

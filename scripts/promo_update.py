@@ -185,8 +185,7 @@ def plan_globally(run_dir, platforms=PLATFORMS):
     """When two sources offer the same mix this run, collect only the best copy: lossless first, then the
     platform order in promo_adapters. The others are deferred; reconcile ignores deferrals, so a failed winner
     is fetched from the next source in the same run."""
-    from promo_pipeline import (SAME_LENGTH_SECONDS, dj_version, format_rank, loose_key, mix_key, mix_parts,
-                                version_group, version_kind)
+    from promo_pipeline import dj_version, format_rank, loose_key, mix_key, shorter_version, version_group, version_kind
     offers, versions = {}, {}
     for priority, platform in enumerate(platforms):
         report = load(run_dir / f"{platform}-plan.json")
@@ -207,8 +206,10 @@ def plan_globally(run_dir, platforms=PLATFORMS):
     defer, choices = {}, []
     for group in versions.values():
         # 2026-11-03: a radio edit from one promo and the extended mix from another arrive in the same run. Only the
-        # extended mix survives, as within one release. 'Radio edit' is a version marked radio or edit, or one with
-        # no mix name that is not clearly longer. A DJ edit and an explicit Original Mix keep their own decision.
+        # extended mix survives, as within one release. A DJ edit keeps its own decision.
+        # 2026-11-12: the final audit skipped 'Aftermoon (Original Mix)' (232 s), collected beside the extended mix collected from
+        # another promo the same run. An explicit Original now gives way like an unmarked version: shorter_version()
+        # is the audit's rule, and only an Original or unmarked copy clearly longer than the extended mix stays.
         extended = [o for o in group if version_kind(o["track"]) == "extended"]
         if not extended:
             continue
@@ -217,9 +218,7 @@ def plan_globally(run_dir, platforms=PLATFORMS):
             kind = version_kind(offer["track"])
             if kind == "extended" or dj_version({"name": offer["track"], "duration": offer["seconds"]}):
                 continue
-            unmarked = kind == "full" and not mix_parts(offer["track"])[1]
-            if kind == "short" or unmarked and not (longest and offer["seconds"]
-                                                    and offer["seconds"] > longest + SAME_LENGTH_SECONDS):
+            if shorter_version(kind, "extended", offer["seconds"], longest or None):
                 best = max(extended, key=lambda o: (o["rank"], -o["priority"]))
                 defer.setdefault(offer["platform"], {}).setdefault(offer["source_id"], {})[offer["track"]] = \
                     f"the extended mix is collected from {best['platform']} this run"
@@ -459,7 +458,8 @@ def summary(store, run_dir, platforms=PLATFORMS):
     leftovers = load(STATE / "research-leftovers.json", [])
     choices = load(run_dir / "global-plan.json", {}).get("choices", [])
     upgrades = sorted(notes["upgrades"])
-    result = {"delivered": len({p for p in delivered if p}), "audit": audit.get("counts", {}),
+    # 2026-11-12: as_of tells a reader whether a later audit or research run already refreshed this summary.
+    result = {"as_of": now(), "delivered": len({p for p in delivered if p}), "audit": audit.get("counts", {}),
               "ready_to_merge": audit.get("ready_to_merge", False), "exceptions": exceptions,
               "unavailable_releases": unavailable, "blocked_by_platform": dict(blocked),
               "ignored_links": ignored, "outcome_reclassifications": list(notes["reclassified"].values()),
@@ -522,6 +522,9 @@ def summary(store, run_dir, platforms=PLATFORMS):
     if leftovers:
         lines.append("Labels that promo pages, emails, Beatport and web research could not settle: "
                      + "; ".join(r["name"] for r in leftovers) + ".")
+    unreached = [r["name"] for r in leftovers if r.get("beatport") == "blocked"]
+    if unreached:
+        lines.append(f"Beatport could not be reached for {len(unreached)} of them; research again later before asking.")
     result["text"] = "\n".join(lines)
     save(run_dir / "summary.json", result)
     return result
@@ -556,7 +559,10 @@ def phase(args):
         elif args.phase == "research":
             from promo_research import run as research
             result = research(store, args.run_dir, deliver=True)
-        elif args.phase == "summary":
+        if args.phase in {"audit", "research"} and (args.run_dir / "summary.json").exists():
+            # 2026-11-12: a research or audit run after the summary left summary.json with the old counts.
+            summary(store, args.run_dir, args.platforms)
+        if args.phase == "summary":
             result = summary(store, args.run_dir, args.platforms)
             try:
                 result["housekeeping"] = housekeeping(store, args.run_dir)

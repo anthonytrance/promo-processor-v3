@@ -25,6 +25,21 @@ CDN = "https://drip38d09qbfk.cloudfront.net"
 TYPES = {"wav", "aif", "aiff", "flac", "mp3", "m4a"}
 
 
+def campaign_artist(campaign):
+    """The release artist of a single-artist campaign, for tracks without their own artist; None when unclear.
+
+    The campaign name and the mail subject must both read 'Artist - ...' with the same artist. Various-artist
+    packs and anything else stay without an artist, so research asks rather than guesses.
+    """
+    heads = [(campaign.get(k) or "").partition(" - ") for k in ("name", "emailSubject")]
+    if not all(sep and head.strip() for head, sep, _ in heads):
+        return None
+    artist = heads[0][0].strip()
+    if artist.casefold() != heads[1][0].strip().casefold() or re.fullmatch(r"(?i)v\.?\s*a\.?|various(?:\s+artists)?", artist):
+        return None
+    return artist
+
+
 def normalize_release(data):
     campaign = data["campaign"]
     if campaign.get("archived") or campaign.get("deleted_at") or campaign.get("visibility") == "private":
@@ -39,9 +54,15 @@ def normalize_release(data):
         if expiry <= datetime.now(timezone.utc):
             raise ReleaseUnavailable("Campaign has expired")
     tracks = []
+    release_artist = campaign_artist(campaign)
     for track in campaign.get("tracks") or []:
-        artist = (track.get("track_artist") or "").strip()
+        artist = (track.get("track_artist") or "").strip() or release_artist
         title = (track.get("track_title") or "").strip()
+        # 2026-11-12: 'Truthlive - MAINSTAGE MUSIC' sent '01. This Feelin' with no track artist, which became
+        # 'Unknown Artist - 01. This Feelin'. The number goes only when it is this track's own number.
+        number = re.match(r"^0*(\d{1,3})\s*[.)]\s+(?=\S)", title)
+        if number and int(number.group(1)) == int(track.get("track_num") or 0):
+            title = title[number.end():]
         files = [{"id": file["file_id"], "type": file["file_extension"].lower().lstrip("."),
                   "size_bytes": file.get("file_size"), "name": file["file_name"],
                   "index": int(track.get("track_num") or 1) - 1}

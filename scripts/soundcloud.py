@@ -21,7 +21,7 @@ from audio_length import container
 from promo_automation import SETTINGS, Store
 from promo_cloud import protect_json, read_protected_json
 from promo_mail import discover, newest_offer_age
-from promo_pipeline import LibraryIndex, collect_release, write_stream
+from promo_pipeline import LibraryIndex, collect_release, strip_download_note, write_stream
 from soundcloud_session import SESSION_FILE, SoundCloudSession, TokenExpired
 from promo_outcomes import NotARelease, ReleaseUnavailable, soundcloud_profile
 
@@ -39,6 +39,8 @@ _SUBJECT_NOTE = re.compile(r"\b(?:" + "|".join(
     ["submission", "demo", "bpm", "free", "exclusive", "promo", "premiere", "ep", "lp", "album"]
     + [r"\s+".join(map(re.escape, w.split())) for w in SETTINGS.get("subject_note_words", [])]) + r")\b"
     r"|^[A-Z]{2,8}\s?\d{2,5}$", re.I)
+_GUEST = re.compile(r"(?:feat\.?|ft\.?|featuring|with)\s", re.I)
+_norm = lambda text: re.sub(r"[^a-z0-9]+", " ", (text or "").casefold()).strip()
 # Two uploads of one track (an MP3 and a WAV copy) share a title and differ in length by at most this many seconds.
 SAME_UPLOAD_SECONDS = 2
 
@@ -68,9 +70,16 @@ def link_variants(url):
     return variants
 
 
-def split_title(raw, artist_hint=None):
-    """Clean a SoundCloud title: drop PROMO prefixes and release notes, keep mix names, pull a bracketed label."""
-    title, label = _PROMO_PREFIX.sub("", raw or "").strip(), None
+def split_title(raw, artist_hint=None, known_labels=()):
+    """Clean a SoundCloud title: drop PROMO prefixes and release notes, keep mix names, pull a bracketed label.
+
+    2026-11-12: 'Bush It (Generation Smash) DOWNLOAD ENABLED' and 'My Mind [INTERPLAY RECORDS] Download Enabled'
+    reached the library as titles. A trailing download note is dropped first. A trailing round bracket that names
+    no mix and no guest is taken as the label only when that label is known from elsewhere (the promo mail or
+    label_codes.csv): '(Generation Smash)' may as well be a subtitle such as '(Nur Für Dich)', so without that
+    support it stays in the title and research settles it. Mix names and feat. credits are never touched.
+    """
+    title, label = strip_download_note(_PROMO_PREFIX.sub("", raw or "").strip()), None
     while True:
         match = _BRACKET.search(title)
         if not match:
@@ -89,6 +98,11 @@ def split_title(raw, artist_hint=None):
     tail = _TAIL_AFTER_MIX.match(title)
     if tail:  # "See The World (Extended) Generation Smash/Smash The House": the label follows the mix bracket
         title, label = tail.group(1), label or tail.group(2).split("/")[0].strip()
+    paren = re.search(r"\s*\(([^()]+)\)\s*$", title)
+    if paren and not _MIX_WORDS.search(paren.group(1)) and not _GUEST.match(paren.group(1)):
+        known = {_norm(k): k for k in known_labels if k}
+        if _norm(paren.group(1)) in known:
+            title, label = title[:paren.start()].rstrip(), label or paren.group(1).strip()
     artist, sep, rest = title.partition(" - ")
     if sep:
         return artist.strip(), rest.strip(), label
@@ -96,6 +110,18 @@ def split_title(raw, artist_hint=None):
     if hint and title.casefold().startswith(hint.casefold() + " "):
         title = title[len(hint):].strip()  # "Neounique vision" by Neounique
     return hint or None, title, label
+
+
+_KNOWN_LABELS = []
+
+
+def known_labels():
+    """Label names from label_codes.csv: support for reading a trailing '(Label)' as the imprint."""
+    if not _KNOWN_LABELS:
+        from pathlib import Path
+        from process_promos import load_label_codes
+        _KNOWN_LABELS.append(sorted(set(load_label_codes(str(Path(__file__).with_name("label_codes.csv"))).values())))
+    return _KNOWN_LABELS[0]
 
 
 def mail_label(subject, sender=None):
@@ -124,11 +150,13 @@ def normalize_release(item, extra_tracks=(), subject=None, sender=None):
     full = {t["id"]: t for t in extra_tracks}
     entries = [full.get(t["id"], t) for t in item["tracks"]] if item["kind"] == "playlist" else [item]
     tracks, warnings = [], []
+    known = [mail_label(subject, sender), item.get("label_name"), *known_labels()]
     for entry in entries:
         if "title" not in entry:
             raise RuntimeError("SoundCloud playlist track could not be loaded")
         meta = entry.get("publisher_metadata") or {}
-        artist, title, bracket_label = split_title(html.unescape(entry["title"]), meta.get("artist"))
+        artist, title, bracket_label = split_title(html.unescape(entry["title"]), meta.get("artist"),
+                                                   known + [entry.get("label_name"), meta.get("publisher")])
         if item["kind"] == "track" and subject and title.casefold() in _GENERIC:
             # "Andre S Demo": the mail subject names the track. Its brackets are notes, never the label.
             named = split_title(re.sub(r"^\s*(?:re|fwd?)\s*:\s*", "", subject, flags=re.I).split(":", 1)[-1])
@@ -137,6 +165,15 @@ def normalize_release(item, extra_tracks=(), subject=None, sender=None):
         if not artist and item["kind"] == "track":
             artist = (entry.get("user") or {}).get("username") or None  # an artist's own upload: "Deeper and Deeper"
         from_mail = mail_label(subject, sender)
+        if artist and subject:
+            # 2026-11-12: 'STRATUM Records - Upside Down' came from the label's account. When the artist is only the
+            # label or sender and the subject reads 'Artist - Title [Label]' for this title, the subject names the artist.
+            owners = {_norm(n) for n in (from_mail, re.sub(r"\s*<[^>]*>\s*$", "", sender or "").strip().strip('"'),
+                                         entry.get("label_name"), meta.get("publisher"), item.get("label_name")) if n}
+            named = split_title(re.sub(r"^\s*(?:(?:re|fwd?)\s*:\s*)+", "", subject, flags=re.I))
+            bare = lambda t: _norm(re.sub(r"(?:\s*\([^()]*\))+\s*$", "", t or ""))
+            if _norm(artist) in owners and named[0] and named[2] and bare(named[1]) and bare(named[1]) == bare(title):
+                artist = named[0]
         if from_mail and artist and from_mail.casefold() in artist.casefold():
             from_mail = None  # an artist mailing their own track names themselves, not a label
         label = (entry.get("label_name") or meta.get("publisher") or bracket_label or item.get("label_name")

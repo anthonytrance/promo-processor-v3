@@ -91,8 +91,112 @@ class BeatportTests(unittest.TestCase):
         self.assertEqual(hit["evidence"], "same ISRC")
 
 
+class FakeResponse:
+    def __init__(self, status, text):
+        self.status_code, self.text = status, text
+
+
+def page(tracks):
+    return FakeResponse(200, '<script id="__NEXT_DATA__" type="application/json">'
+                        + json.dumps({"props": {"queries": [{"state": {"data": {"data": tracks}}}]}}) + "</script>")
+
+
+class BeatportAccessTests(unittest.TestCase):
+    def setUp(self):
+        research._BEATPORT.update(fingerprint=None, blocked=None)
+        self.addCleanup(research._BEATPORT.update, fingerprint=None, blocked=None)
+
+    def test_refused_fingerprint_falls_through_and_the_working_one_is_kept(self):
+        calls = []
+
+        def get(url, params=None, impersonate=None, timeout=None):
+            calls.append(impersonate)
+            return FakeResponse(403, "<title>Just a moment...</title>") if impersonate == "firefox135" else page([bp("S", "Original Mix", ["A"], "L")])
+        self.assertEqual(research.beatport_search("A S", get)[0]["track_name"], "S")
+        self.assertEqual(calls, ["firefox135", "safari18_0"])
+        research.beatport_search("A S", get)
+        self.assertEqual(calls[-1], "safari18_0", "the fingerprint that worked is tried first")
+
+    def test_page_without_results_is_no_match_not_blocked(self):
+        self.assertEqual(research.beatport_search("x", lambda *a, **k: page([])), [])
+        self.assertIsNone(research._BEATPORT["blocked"])
+
+    def test_every_fingerprint_refused_is_blocked_evidence(self):
+        calls = []
+
+        def get(url, params=None, impersonate=None, timeout=None):
+            calls.append(impersonate)
+            return FakeResponse(403, "Just a moment...")
+        with self.assertRaises(research.BeatportBlocked):
+            research.beatport_search("x", get)
+        self.assertEqual(len(calls), len(research.BEATPORT_FINGERPRINTS))
+        _, outcome = research.research({"artist": "A", "title": "Song", "source_id": None, "original_names": []},
+                                       search=lambda q: research.beatport_search(q, get), codes={})
+        self.assertEqual(len(calls), len(research.BEATPORT_FINGERPRINTS), "a blocked run does not hammer Beatport")
+        self.assertEqual((outcome["state"], outcome["beatport"]), ("unresolved", "blocked"))
+        self.assertIn("retry later", outcome["evidence"][-1]["why"])
+
+    def test_unmarked_upload_takes_the_version_of_the_same_length(self):
+        hits = [dict(bp("My Mind", "Original Mix", ["Eximinds", "Bersu Bayraktar"], "Interplay Records", track_id=1), length_ms=180000),
+                dict(bp("My Mind", "Extended Mix", ["Eximinds", "Bersu Bayraktar"], "Interplay Records", track_id=2), length_ms=219000)]
+        hit = research.beatport_match("Eximinds & Bersu Bayraktar", "My Mind", search=lambda q: hits, duration=219.4)
+        self.assertEqual((hit["length_mix"], hit["url"][-1]), ("Extended Mix", "2"))
+        self.assertEqual(research.beatport_match("Eximinds & Bersu Bayraktar", "My Mind", search=lambda q: hits)["mix_name"],
+                         "Original Mix", "without a length the Original Mix stays the answer")
+        resolution, _ = research.research({"artist": "Eximinds & Bersu Bayraktar", "source_id": None, "original_names": [],
+                                           "title": "My Mind [INTERPLAY RECORDS] Download Enabled", "duration": 219.4},
+                                          search=lambda q: hits, codes={})
+        self.assertEqual(resolution["title"], "My Mind (Extended Mix)")
+
+    def test_trailing_bracket_is_dropped_only_when_beatport_agrees_it_is_the_label(self):
+        hits = [bp("Bush It", "Original Mix", ["AvAlanche", "Bersu Bayraktar", "Meteos"], "Generation Smash", catalog="GS456BP")]
+        search = lambda q: hits if "(" not in q else []
+        hit = research.beatport_match("AvAlanche & Bersu Bayraktar & Meteos", "Bush It (Generation Smash) DOWNLOAD ENABLED",
+                                      search=search)
+        self.assertEqual((hit["label"], hit["title"]), ("Generation Smash", "Bush It"))
+        self.assertIsNone(research.beatport_match("AvAlanche & Bersu Bayraktar & Meteos", "Bush It (Other Name)", search=search))
+
+
+class FakeMail:
+    def __init__(self, text):
+        self.text = text
+
+    def texts(self, source_id):
+        return [("mail:synthetic@example.com", self.text)]
+
+
+class MailLayoutTests(unittest.TestCase):
+    def test_label_line_under_each_track(self):
+        found = research.parse_mail("Subject: Sampler\nA & B – One (Extended Mix)\nLabel: First Label\n\n"
+                                    "C — Two (Extended Mix)\nLabel: Second Label (Parent Group)\n")
+        self.assertEqual(research.mail_label(found, "A, B", "One (Extended Mix)")[0], "First Label")
+        self.assertEqual(research.mail_label(found, "C", "Two (Extended Mix)")[0], "Second Label")
+
+    def test_two_line_artist_title_then_label_genre(self):
+        text = ("A – One\nLabel One – Indie Dance\nShort synthetic description.\n\n"
+                "B – Two\nLabel Two – Trance / Uplifting Trance\nAnother line.\n")
+        found = research.parse_mail(text)
+        self.assertEqual(research.mail_label(found, "B", "Two")[0], "Label Two")
+        self.assertEqual(research.parse_mail("A – One\nLabel One – Indie Dance\n")["track_labels"], [],
+                         "a single pair is not enough to read the layout")
+        self.assertEqual(research.parse_mail("A - One\nX - Two Words Here\nB - Three\nY - Not A Genre\n")["track_labels"], [])
+
+    def test_release_urls_and_catalog_are_evidence(self):
+        text = "Subject: PROMO: A - Song\nCatalog: STR020\nhttps://www.beatport.com/release/song/123456\n"
+        _, outcome = research.research({"artist": "A", "title": "Song", "source_id": "s", "original_names": []},
+                                       mail=FakeMail(text), search=lambda q: [], codes={})
+        self.assertEqual(outcome["catalogs"], ["STR020"])
+        self.assertTrue(any(e["source"].startswith("https://www.beatport.com/release/") for e in outcome["evidence"]))
+
+    def test_mail_label_line_beats_a_tag_that_repeats_the_artist(self):
+        resolution, outcome = research.research(
+            {"artist": "Sound Players", "title": "Song (Extended Mix)", "tag_label": "Sound Players", "source_id": "s",
+             "original_names": []}, mail=FakeMail("Label: Global Code\n"), search=lambda q: [], codes={})
+        self.assertEqual(resolution["label"], "Global Code")
+
+
 class ResearchTests(unittest.TestCase):
-    item = {"artist": "DJ Dani", "title": "Autumn Evening (Extended Mix)", "source_id": None, "original_names": []}
+    item ={"artist": "DJ Dani", "title": "Autumn Evening (Extended Mix)", "source_id": None, "original_names": []}
 
     def test_catalogue_spelling_wins_when_beatport_agrees(self):
         hits = [bp("Autumn Evening", "Extended Mix", ["DJ Dani"], "Lost Kommunication Records Ltd")]

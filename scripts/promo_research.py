@@ -17,7 +17,8 @@ import unicodedata
 
 from promo_automation import ACCOUNT, DEST, HOLD, STATE, Store, atomic_text, dropbox_skill, email_skill, normalized, now
 from promo_metadata import SELF_RELEASED, distributor_only, find_resolution, label_issues
-from promo_pipeline import _ARTIST_SPLIT, excluded, load_exclusions, mix_key, validate_audio
+from promo_pipeline import (_ARTIST_SPLIT, excluded, label_is_artist, load_exclusions, mix_key, strip_download_note,
+                            validate_audio)
 from process_promos import (build_target_filename, clean_master_suffixes, load_label_codes, normalize_ft_to_feat,
                            normalize_mix_type, read_existing_tags, write_tags)
 
@@ -71,15 +72,33 @@ def subject(message):
 
 def parse_mail(text):
     """Every label statement an announcement makes, keeping the line it came from."""
-    found = {"labels": [], "catalogs": [], "isrcs": [], "track_labels": []}
-    for line in text.splitlines():
+    found = {"labels": [], "catalogs": [], "isrcs": [], "track_labels": [], "release_urls": []}
+    lines = [re.sub(r"\s+[–—]\s+", " - ", line) for line in text.splitlines()]  # en and em dashes read as ' - '
+    # 2026-11-12: 'Tony S3rmani – Què Pasa' / 'Dance Republic – Indie Dance' / description, once per track. The
+    # second line is the label only when this two-line pattern with a genre after the dash repeats in the mail.
+    pairs = [(lines[i], lines[i + 1]) for i in range(len(lines) - 1)
+             if _TRACK_LINE.match(lines[i]) and re.match(r"^([^:]+?) - (.+)$", lines[i + 1])
+             and _GENRE.search(lines[i + 1].partition(" - ")[2])]
+    if len(pairs) >= 2:
+        found["track_labels"] += [(track, label.partition(" - ")[0].strip()) for track, label in pairs]
+    last_track = None
+    for line in lines:
+        found["release_urls"] += re.findall(r"https?://(?:www\.)?beatport\.com/release/[^\s\"'<>)]+", line)
         # 'Artist - Title [Label]' subjects name the imprint; a bracket with digits is a catalog number.
         match = re.match(r"^Subject:.* - .*\[([^\]\d]+)\]\s*$", line)
         if match:
             found["labels"].append(match.group(1).strip())
         match = re.match(r"^(?:Record\s+)?(?:Label|Imprint)\s*[:\-]\s*(.+)$", line, re.I)
         if match:
-            found["labels"].append(match.group(1).strip())
+            # 2026-11-12: 'Generation Smash (Smash The House)' names the imprint and its parent; the imprint is filed.
+            label = re.sub(r"\s*\([^()]*\)\s*$", "", match.group(1).strip()) or match.group(1).strip()
+            found["labels"].append(label)
+            if last_track:
+                # A Label line under a track line belongs to that track in a multi-track announcement.
+                found["track_labels"].append((last_track, label))
+                last_track = None
+        elif _TRACK_LINE.match(line) and not line.startswith("Subject:"):
+            last_track = re.sub(r"^\d{1,3}\s*[.)]\s*", "", line).strip()
         match = re.search(r"\b(?:Released|Out(?:\s+now)?)\s+(?:through|via|on)\s+([A-Z0-9][^\n.,!(]{1,50}?)(?:\s+on\s+\w+|\s*[.,!(]|$)", line)
         if match and not re.match(r"(?:Beatport|Spotify|all|\d)", match.group(1), re.I):
             found["labels"].append(match.group(1).strip())
@@ -91,9 +110,19 @@ def parse_mail(text):
         match = re.match(r"^(?:[A-Z]{2,}\d+\s+)?(.+? - .+?)\s*\(([^()]+)\)\s*$", line)
         if match and not re.search(r"\b" + _MIX_WORDS + r"\b", match.group(2), re.I):
             found["track_labels"].append((match.group(1).strip(), match.group(2).strip()))
-    for key in ("labels", "catalogs", "isrcs"):
+    for key in ("labels", "catalogs", "isrcs", "release_urls"):
         found[key] = list(dict.fromkeys(found[key]))
     return found
+
+
+# 'Artist - Title' on a line of its own; 'Release Date - 20.11', 'Label - X' or a 'Key: value' line is not one.
+_TRACK_LINE = re.compile(r"^(?:\d{1,3}\s*[.)]\s*)?(?!(?:record\s+)?(?:label|imprint|cat\w*|release\w*|genre|style|bpm|key)\b)"
+                         r"[^:\n]{1,80}? - [^\n]{1,120}$", re.I)
+# A genre and nothing else: 'Indie Dance', 'Trance / Uplifting Trance', 'Techno (Peak Time / Driving)'.
+_GENRE_WORD = (r"(?:techno|trance|house|dance|progressive|psy\w*|drum|bass|breaks?|breakbeat|electro\w*|hard\w*|melodic|"
+               r"tech|minimal|ambient|edm|dubstep|garage|disco|nu|downtempo|afro|indie|dnb|pop|uplifting|vocal|deep|"
+               r"organic|bounce|peak|time|driving|raw|hypnotic|big|room|future|funky|groove|mainstage|and|n|electronica)")
+_GENRE = re.compile(r"^[\s(]*" + _GENRE_WORD + r"(?:[\s/&,()+-]+" + _GENRE_WORD + r")*[\s)]*$", re.I)
 
 
 class Mail:
@@ -132,20 +161,55 @@ class Mail:
                 pass
 
 
-def beatport_search(query):
-    from curl_cffi import requests
-    for attempt in range(3):  # Beatport search times out now and then; one miss should not leave a track unresolved.
-        try:
-            response = requests.get("https://www.beatport.com/search/tracks", params={"q": query},
-                                    impersonate="chrome124", timeout=30)
-            break
-        except Exception:
-            if attempt == 2:
-                raise
-            time.sleep(5 * (attempt + 1))
-    match = re.search(r'<script id="__NEXT_DATA__"[^>]*>(.*?)</script>', response.text, re.S)
-    if response.status_code != 200 or not match:
-        return []
+class BeatportBlocked(RuntimeError):
+    """Every browser fingerprint was refused or Beatport did not answer: not the same as 'no match'."""
+
+
+# 2026-11-12: Cloudflare started refusing chrome124 with a 403 'Just a moment' page while firefox135 still
+# got the search page. Non-Chrome fingerprints first, chrome124 last; the first that works is kept per process.
+BEATPORT_FINGERPRINTS = ("firefox135", "safari18_0", "firefox133", "safari17_0", "edge101", "chrome124")
+_BEATPORT = {"fingerprint": None, "blocked": None}
+_NEXT_DATA = re.compile(r'<script id="__NEXT_DATA__"[^>]*>(.*?)</script>', re.S)
+
+
+def beatport_page(url, params=None, get=None):
+    """(response, __NEXT_DATA__ text) for a beatport.com page, trying fingerprints until one is let through."""
+    if get is None:
+        from curl_cffi import requests
+        get = requests.get
+    if _BEATPORT["blocked"]:
+        raise BeatportBlocked(_BEATPORT["blocked"])  # one full refusal per run is enough; no hammering
+    order = [_BEATPORT["fingerprint"]] if _BEATPORT["fingerprint"] else []
+    order += [f for f in BEATPORT_FINGERPRINTS if f not in order]
+    reasons = []
+    for fingerprint in order:
+        response = None
+        for attempt in range(3):  # Beatport search times out now and then; one miss should not leave a track unresolved.
+            try:
+                response = get(url, params=params, impersonate=fingerprint, timeout=30)
+                break
+            except Exception as error:
+                if attempt == 2:
+                    reasons.append(f"{fingerprint}: {type(error).__name__}")
+                else:
+                    time.sleep(5 * (attempt + 1))
+        if response is None:
+            continue
+        match = _NEXT_DATA.search(response.text or "")
+        if response.status_code == 200 and match:
+            _BEATPORT["fingerprint"] = fingerprint
+            return response, match.group(1)
+        challenge = "Just a moment" in (response.text or "")[:5000]
+        reasons.append(f"{fingerprint}: HTTP {response.status_code}" + (" challenge" if challenge else "")
+                       + ("" if match else " no page data"))
+        if _BEATPORT["fingerprint"] == fingerprint:
+            _BEATPORT["fingerprint"] = None
+    _BEATPORT["blocked"] = "; ".join(reasons) or "no answer"
+    raise BeatportBlocked(_BEATPORT["blocked"])
+
+
+def beatport_search(query, get=None):
+    _, data = beatport_page("https://www.beatport.com/search/tracks", {"q": query}, get)
 
     def find(node):
         if isinstance(node, dict):
@@ -159,7 +223,7 @@ def beatport_search(query):
                 if hit:
                     return hit
         return None
-    return find(json.loads(match.group(1))) or []
+    return find(json.loads(data)) or []
 
 
 _GENERIC_MIX = {"original", "extended", "radio", "club", "intro", "outro", "dub", "instrumental", "vocal",
@@ -173,16 +237,47 @@ def compatible_mix(ours, theirs):
     return mine & other if mine else not other
 
 
+LENGTH_MATCH_SECONDS = 2.5
 _NAMED_MIX = re.compile(r"\s*\(([^()]*\b(?:mix|remix|edit|version|rework|dub)\b[^()]*)\)\s*$", re.I)
 
 
-def beatport_match(artist, title, isrc=None, search=beatport_search):
-    """The Beatport track with the same artists, title and mix. ISRC alone is proof of identity."""
+def beatport_match(artist, title, isrc=None, search=beatport_search, duration=None):
+    """The Beatport track with the same artists, title and mix. ISRC alone is proof of identity.
+
+    2026-11-12: an upload without a mix name ('My Mind', 219 s) matches the Original, Extended and Radio
+    versions alike. With a known duration the version within LENGTH_MATCH_SECONDS wins and its mix name is
+    returned as 'length_mix', so the resolution can carry it. ISRC still comes first.
+    """
+    title = strip_download_note(title)
     base, mix = split_title(title)
+    # 'Bush It (Generation Smash)': a trailing bracket that names no mix and no guest may be the label. The title
+    # without it is tried only after the full title found nothing, and only a Beatport label that agrees with the
+    # bracket accepts it; the hit then carries 'title' without the bracket.
+    bracket = re.match(r"^(.*?)\s*[(\[]([^()\[\]]+)[)\]]\s*$", base)
+    if bracket and (re.search(r"\b" + _MIX_WORDS + r"\b", bracket.group(2), re.I)
+                    or re.match(r"(?:feat\.?|ft\.?|featuring|with)\s", bracket.group(2), re.I)):
+        bracket = None
+    hit = _beatport_match(artist, base, mix, isrc, search, duration)
+    if hit is None and bracket:
+        hit = _beatport_match(artist, bracket.group(1), mix, isrc, search, duration)
+        if hit and not agrees(bracket.group(2), hit["label"]):
+            hit = None
+        elif hit:
+            hit["title"] = bracket.group(1) + (f" ({mix})" if mix else "")
+    return hit
+
+
+def agrees(a, b):
+    # 'HIGH VOLTAGE' and 'High Voltage Recordings' agree; 'MixCult Records' and 'MixCult Digital' do not.
+    a, b = normalized(a), normalized(b)
+    return bool(a and b) and (a in b or b in a)
+
+
+def _beatport_match(artist, base, mix, isrc, search, duration):
     artists = artist_set(artist)
     queries = ([isrc] if isrc else []) + [f"{artist} {base}"]
     for query in queries:
-        best = None
+        best, by_length = None, None
         for track in search(query):
             label = (track.get("label") or {}).get("label_name") if isinstance(track.get("label"), dict) else None
             names = artist_set(", ".join(a.get("artist_name", "") for a in track.get("artists") or []))
@@ -210,11 +305,20 @@ def beatport_match(artist, title, isrc=None, search=beatport_search):
                    "artists": [a.get("artist_name") for a in track.get("artists") or []],
                    "url": f"https://www.beatport.com/track/{slug}/{track['track_id']}",
                    "evidence": "same ISRC" if same_isrc else "same artists and title" + (" and mix" if same_mix else "")}
-            if same_isrc or same_mix:
+            if same_isrc:
                 return hit
+            length = (track.get("length_ms") or track.get("length") or 0) / 1000
+            if mix is None and duration and length and abs(length - float(duration)) <= LENGTH_MATCH_SECONDS:
+                by_length = by_length or dict(hit, length_mix=beatport_mix or "Original Mix",
+                                              evidence=f"same artists and title and length ({length:.0f}s)")
+                continue
+            if same_mix and not (mix is None and duration):
+                return hit
+            if same_mix and not (best or {}).get("evidence", "").endswith("and mix"):
+                best = hit  # without a length match the Original Mix stays the answer, as before
             best = best or hit
-        if best:
-            return best
+        if by_length or best:
+            return by_length or best
     return None
 
 
@@ -242,9 +346,9 @@ def mail_label(found, artist, title):
 
 def research(item, mail=None, search=beatport_search, codes=None):
     """Return (resolution or None, evidence). A resolution needs independent public or first-party proof."""
-    artist, title = item["artist"], item["title"]
+    artist, title = item["artist"], strip_download_note(item["title"])
     evidence, sources = [], []
-    found = {"labels": [], "catalogs": [], "isrcs": [], "track_labels": []}
+    found = {"labels": [], "catalogs": [], "isrcs": [], "track_labels": [], "release_urls": []}
     first_party = None
     for source, text in (mail.texts(item["source_id"]) if mail and item.get("source_id") else []):
         parsed = parse_mail(text)
@@ -255,16 +359,28 @@ def research(item, mail=None, search=beatport_search, codes=None):
             first_party = (label, source, why)
     if first_party:
         evidence.append({"source": first_party[1], "label": first_party[0], "why": first_party[2]})
+    for url in found["release_urls"][:3]:
+        evidence.append({"source": url, "why": "release page named by the announcement; not fetched"})
     for label in [item.get("platform_label"), item.get("tag_label")]:
-        if trusted(label):
+        if first_party and label and (label_is_artist(label, {"artist": artist}) or
+                                      normalized(label) == normalized(item.get("sender") or "")):
+            # 2026-11-12: the mail's own 'Label: Global Code' outranks a tag that only repeats the artist
+            # ('Sound Players') or the sender; such a tag is the uploader's name, not an imprint.
+            evidence.append({"source": "platform/tag", "why": "'" + label + "' is only the artist or sender; mail label kept"})
+        elif trusted(label):
             evidence.append({"source": "platform/tag", "label": label})
     isrc = item.get("isrc") or (found["isrcs"][0] if len(found["isrcs"]) == 1 else None)
     code_label, catalog = catalog_label(found["catalogs"] + [c for c in [item.get("catalog")] if c], codes)
     if code_label:
         evidence.append({"source": "label_codes.csv", "label": code_label, "catalog": catalog})
-    beatport = None
+    beatport, blocked = None, None
     try:
-        beatport = beatport_match(artist, title, isrc, search)
+        beatport = beatport_match(artist, title, isrc, search, item.get("duration"))
+    except BeatportBlocked as error:
+        # 2026-11-12: a refused search proves nothing about the label; say so instead of 'no label found'.
+        blocked = {"source": "beatport", "error": "blocked",
+                   "why": "Beatport could not be reached (blocked); retry later, not a missing label: " + str(error)[:200]}
+        evidence.append(blocked)
     except Exception as error:
         evidence.append({"source": "beatport", "error": type(error).__name__})
     self_released = beatport and distributor_only(beatport["label"])
@@ -279,13 +395,9 @@ def research(item, mail=None, search=beatport_search, codes=None):
         evidence.append(labels[0])
         beatport = None
     if not labels:
-        return None, {"state": "unresolved", "evidence": evidence, "catalogs": found["catalogs"], "isrcs": found["isrcs"]}
+        return None, {"state": "unresolved", "evidence": evidence, "catalogs": found["catalogs"], "isrcs": found["isrcs"],
+                      **({"beatport": "blocked"} if blocked else {})}
     distinct = {normalized(re.sub(r"\b(?:ltd|llc|inc|gmbh|bv)\b\.?", "", e["label"], flags=re.I)) for e in labels}
-
-    def agrees(a, b):
-        # 'HIGH VOLTAGE' and 'High Voltage Recordings' agree; 'MixCult Records' and 'MixCult Digital' do not.
-        a, b = normalized(a), normalized(b)
-        return a in b or b in a
     if beatport and not self_released:
         # 2026-10-23: the Beatport label overrules every other source. The catalogue spelling
         # is kept only when it names the same label, so library folders stay consistent.
@@ -298,12 +410,16 @@ def research(item, mail=None, search=beatport_search, codes=None):
         # The catalogue spelling keeps library folders consistent; otherwise the sender's own line.
         chosen = clean_label(code_label or labels[0]["label"])
         if not all(agrees(name, chosen) for name in distinct):
-            return None, {"state": "conflict", "evidence": evidence}
+            return None, {"state": "conflict", "evidence": evidence, **({"beatport": "blocked"} if blocked else {})}
     sources = [e["source"] for e in labels if e["source"].startswith(("https://", "mail:"))]
     if not sources:
         sources = ["https://www.beatport.com"] if beatport else []
     if not sources and code_label:
         sources = ["catalog:" + catalog]
+    if beatport and beatport.get("title"):
+        title = beatport["title"]  # the bracket Beatport proved to be the label, and any download note, are gone
+    if beatport and beatport.get("length_mix") and split_title(title)[1] is None:
+        title = f"{title} ({beatport['length_mix']})"  # 2026-11-12: the version the length proved, not a guess
     resolution = {"artist": artist, "title": title, "label": chosen, "original_names": item.get("original_names", []),
                   "catalog": catalog or (beatport or {}).get("catalog"), "approved_at": now(),
                   "approved_by": "promo_research evidence rule", "sources": sources, "evidence": evidence}
@@ -553,7 +669,8 @@ def run(store, run_dir, deliver=False, search=beatport_search, client=None):
             # The note tells a person what was already tried, so nobody repeats it.
             tried = [(e.get("source") or "") + (": " + e["label"] if e.get("label") else "")
                      + (" (" + e["why"] + ")" if e.get("why") else "") for e in row.get("evidence", [])]
-            write_note(client, item["remote"].path_display, item["issues"] + ["label not settled by research (" + row["state"] + ")"],
+            state = row["state"] + ("; Beatport could not be reached (blocked), retry later" if row.get("beatport") == "blocked" else "")
+            write_note(client, item["remote"].path_display, item["issues"] + ["label not settled by research (" + state + ")"],
                        tried or ["announcement email, platform data, tags, catalogue prefixes and Beatport gave no label"])
         results.append(row)
     if new:
@@ -561,12 +678,13 @@ def run(store, run_dir, deliver=False, search=beatport_search, client=None):
     swept = purge_excluded(store, client, deliver, rules)
     report = {"as_of_utc": now(), "deliver": deliver, "excluded_from_test_folder": swept, "learned_prefixes": add_catalog_prefixes(new) if deliver else {},
               "counts": dict(Counter(r["state"] + ("/" + r["fix"]["state"] if "fix" in r else "") for r in results)),
-              "files": results}
+              "beatport_blocked": sum(r.get("beatport") == "blocked" for r in results), "files": results}
     atomic_text(Path(run_dir) / "research.json", json.dumps(report, ensure_ascii=False, indent=2))
     leftovers = [r for r in results if r["state"] in {"unresolved", "conflict"}]
     atomic_text(store.root / "research-leftovers.json", json.dumps(leftovers, ensure_ascii=False, indent=2))
     store.sync_logs(force=True)
-    return {k: report[k] for k in ("counts", "learned_prefixes")} | {"leftovers": len(leftovers), "excluded_removed": len(swept)}
+    return {k: report[k] for k in ("counts", "learned_prefixes", "beatport_blocked")} | \
+        {"leftovers": len(leftovers), "excluded_removed": len(swept)}
 
 
 if __name__ == "__main__":
@@ -577,5 +695,9 @@ if __name__ == "__main__":
     store = Store()
     try:
         print(json.dumps(run(store, args.run_dir, args.deliver), ensure_ascii=False, indent=2))
+        if (args.run_dir / "summary.json").exists():
+            # 2026-11-12: a research run after the summary left summary.json with the old leftovers and counts.
+            from promo_update import summary
+            summary(store, args.run_dir)
     finally:
         store.db.close()

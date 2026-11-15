@@ -83,6 +83,27 @@ class SoundCloudTests(unittest.TestCase):
         self.assertIsNone(normalize_release(own, subject="Andre S - Eclipse", sender="Andre S <a@b.com>")["label"])
         self.assertEqual(normalize_release(track(3, "IanT &amp; Flund - New Horizon"))["tracks"][0]["artist"], "IanT & Flund")
 
+    def test_download_notes_and_bracket_labels(self):
+        # 2026-11-12: upload titles with a download note and a bare (Label) at the end.
+        self.assertEqual(split_title("Eximinds & Bersu Bayraktar - My Mind [INTERPLAY RECORDS] Download Enabled"),
+                         ("Eximinds & Bersu Bayraktar", "My Mind", "INTERPLAY RECORDS"))
+        junk = "AvAlanche & Bersu Bayraktar & Meteos - Bush It (Generation Smash) DOWNLOAD ENABLED"
+        self.assertEqual(split_title(junk), ("AvAlanche & Bersu Bayraktar & Meteos", "Bush It (Generation Smash)", None),
+                         "an unknown bracket stays in the title for Beatport to settle")
+        self.assertEqual(split_title(junk, known_labels=["Generation Smash"]),
+                         ("AvAlanche & Bersu Bayraktar & Meteos", "Bush It", "Generation Smash"))
+        self.assertEqual(split_title("A - Track (Extended Mix)", known_labels=["Extended Mix"]), ("A", "Track (Extended Mix)", None))
+        self.assertEqual(split_title("A - Track (feat. X) (Radio Edit)"), ("A", "Track (feat. X) (Radio Edit)", None))
+        self.assertEqual(split_title("A - Track [Label]"), ("A", "Track", "Label"))
+        self.assertEqual(split_title("A - Track (Free Download)"), ("A", "Track", None))
+
+    def test_label_named_as_artist_takes_the_subject_artist(self):
+        item = track(8, "STRATUM Records - Upside Down", user={"username": "STRATUM Records"})
+        release = normalize_release(item, subject="PROMO: PTR7 - Upside Down [STRATUM Records]")
+        self.assertEqual(release["tracks"][0]["name"], "PTR7 - Upside Down")
+        other = normalize_release(track(9, "STRATUM Records - Other Song"), subject="PROMO: PTR7 - Upside Down [STRATUM Records]")
+        self.assertEqual(other["tracks"][0]["name"], "STRATUM Records - Other Song", "a different title keeps its artist")
+
     def test_profile_links_are_not_releases(self):
         with self.assertRaises(RuntimeError):
             normalize_release({"kind": "user", "id": 1})

@@ -123,7 +123,7 @@ def resolution_and_version_issues(store, name, test_names, duration=None, owned=
     lowercase_name: the name comes from the lowercase library index, so only a rename beyond capitalization counts.
     """
     from promo_metadata import find_resolution
-    from promo_pipeline import VersionIndex, dj_version, unmarked_name, version_kind
+    from promo_pipeline import VersionIndex, dj_version, shorter_version, unmarked_name, version_kind
     issues = []
     resolution = find_resolution(name, store.root)
     if resolution:
@@ -133,7 +133,8 @@ def resolution_and_version_issues(store, name, test_names, duration=None, owned=
     if dj_version({"name": name, "duration": duration}):
         return issues
     kind = version_kind(name)
-    longer = lambda k: (k == "extended" and kind != "extended") or (k == "full" and kind == "short")
+    # 2026-11-12: the same rule as the planner and decide(); without lengths it is the old test-folder rule.
+    longer = lambda k: shorter_version(kind, k)
     tests = test_names if isinstance(test_names, VersionIndex) else VersionIndex(test_names)
     if any(longer(k) for p, k in tests.versions(name, exact_artists=True) if nfc(Path(p).name).casefold() != nfc(name).casefold()):
         issues.append("Shorter version; a longer version of the same track is in the test folder")
